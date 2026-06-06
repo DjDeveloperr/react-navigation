@@ -1,7 +1,6 @@
 import * as NativeScriptRuntime from '@nativescript/react-native';
 import * as React from 'react';
 import {
-  Platform,
   type StyleProp,
   StyleSheet,
   View,
@@ -31,6 +30,8 @@ type NativeScriptStackRegistry = {
   stackTransitionClosing: Record<string, boolean | undefined>;
   stackTransitionScreenIds: Record<string, string | undefined>;
   stackTransitionTokens: Record<string, number | undefined>;
+  stackModalNavigationControllers: Record<string, any>;
+  stackModalKeys: Record<string, string | undefined>;
   screenHeaderConfigs: Record<string, ScreenStackHeaderConfigProps | undefined>;
   screenContexts: Record<string, any>;
   screenParents: Record<string, string | undefined>;
@@ -109,6 +110,8 @@ function getRegistry(
     stackTransitionClosing: {},
     stackTransitionScreenIds: {},
     stackTransitionTokens: {},
+    stackModalNavigationControllers: {},
+    stackModalKeys: {},
     screenHeaderConfigs: {},
     screenContexts: {},
     screenParents: {},
@@ -243,6 +246,44 @@ function normalControlState() {
   );
 }
 
+function modalPresentationStyle(presentation: unknown) {
+  'worklet';
+  const style = nativeValue('UIModalPresentationStyle');
+
+  if (presentation === 'transparentModal') {
+    return style?.OverFullScreen ?? style?.overFullScreen ?? 5;
+  }
+
+  if (presentation === 'containedTransparentModal') {
+    return style?.OverCurrentContext ?? style?.overCurrentContext ?? 6;
+  }
+
+  if (presentation === 'containedModal') {
+    return style?.CurrentContext ?? style?.currentContext ?? 3;
+  }
+
+  if (presentation === 'formSheet') {
+    return style?.FormSheet ?? style?.formSheet ?? 2;
+  }
+
+  return style?.FullScreen ?? style?.fullScreen ?? 0;
+}
+
+function modalTransitionStyle() {
+  'worklet';
+  const style = nativeValue('UIModalTransitionStyle');
+
+  return style?.CoverVertical ?? style?.coverVertical ?? 0;
+}
+
+function isModalPresentation(presentation: unknown) {
+  'worklet';
+
+  return Boolean(
+    presentation && presentation !== 'push' && presentation !== 'card'
+  );
+}
+
 function leftContentAlignment() {
   'worklet';
   const alignment = nativeValue('UIControlContentHorizontalAlignment');
@@ -294,6 +335,12 @@ function arrayItem(value: any, index: number) {
   'worklet';
 
   if (!value) {
+    return null;
+  }
+
+  const count = arrayCount(value);
+
+  if (index < 0 || index >= count) {
     return null;
   }
 
@@ -366,6 +413,23 @@ function layoutHostedSubviewChain(rootView: any, depth: number) {
   }
 }
 
+function enableHostedInteraction(rootView: any, depth: number) {
+  'worklet';
+
+  if (!rootView || depth > 12) {
+    return;
+  }
+
+  rootView.userInteractionEnabled = true;
+
+  const subviews = rootView.subviews;
+  const count = arrayCount(subviews);
+
+  for (let index = 0; index < count; index += 1) {
+    enableHostedInteraction(arrayItem(subviews, index), depth + 1);
+  }
+}
+
 function layoutHostedReactSubviews(controller: any) {
   'worklet';
   const rootView = controller?.view;
@@ -373,6 +437,8 @@ function layoutHostedReactSubviews(controller: any) {
   if (!rootView) {
     return;
   }
+
+  enableHostedInteraction(rootView, 0);
 
   const subviews = rootView.subviews;
   const count = arrayCount(subviews);
@@ -442,8 +508,10 @@ function configureHeaderBackButton(
   const existingItem = navigationItem.leftBarButtonItem;
   const existingButton = existingItem?.customView;
   const hasNativeScriptBackButton = existingButton?.tag === BACK_BUTTON_TAG;
+  const isModalRoot =
+    count === 1 && isModalPresentation(props.stackPresentation);
   const shouldShowBackButton =
-    count > 1 &&
+    (count > 1 || isModalRoot) &&
     isTopScreen &&
     props.headerConfig?.hideBackButton !== true &&
     typeof props.onHeaderBackButtonClicked === 'function';
@@ -519,6 +587,50 @@ function configureHeaderBackButton(
   }
 }
 
+function measuredHeaderHeight(navigationController: any, fallback: number) {
+  'worklet';
+  const navigationBar = navigationController?.navigationBar;
+  const frame = navigationBar?.frame;
+  const originY = frame?.origin?.y ?? 0;
+  const height = frame?.size?.height ?? 0;
+
+  if (height > 0) {
+    return originY + height;
+  }
+
+  const insets =
+    navigationController?.view?.safeAreaInsets ??
+    navigationController?.topViewController?.view?.safeAreaInsets;
+  const topInset = insets?.top ?? 0;
+
+  return topInset + fallback;
+}
+
+function emitHeaderHeightChange(
+  controller: any,
+  props: Readonly<NativeScriptScreenStackItemProps>,
+  ctx?: any
+) {
+  'worklet';
+
+  if (
+    !ctx ||
+    props.headerConfig?.hidden === true ||
+    typeof props.onHeaderHeightChange !== 'function'
+  ) {
+    return;
+  }
+
+  ctx.emit('onHeaderHeightChange', {
+    nativeEvent: {
+      headerHeight: measuredHeaderHeight(
+        controller?.navigationController,
+        isModalPresentation(props.stackPresentation) ? 56 : 44
+      ),
+    },
+  });
+}
+
 function screenIdForController(
   controller: any,
   registry: NativeScriptStackRegistry
@@ -555,6 +667,44 @@ function navigationControllerScreenIds(
   }
 
   return ids;
+}
+
+function stackVisibleScreenIds(
+  stackId: string,
+  registry: NativeScriptStackRegistry
+) {
+  'worklet';
+  const navigationController = registry.stacks[stackId];
+  const ids = navigationControllerScreenIds(navigationController, registry);
+  const modalNavigationController =
+    registry.stackModalNavigationControllers[stackId];
+
+  if (modalNavigationController) {
+    const modalIds = navigationControllerScreenIds(
+      modalNavigationController,
+      registry
+    );
+
+    for (const modalId of modalIds) {
+      ids.push(modalId);
+    }
+  }
+
+  return ids;
+}
+
+function firstModalIndex(ids: string[], registry: NativeScriptStackRegistry) {
+  'worklet';
+
+  for (let index = 1; index < ids.length; index += 1) {
+    if (
+      isModalPresentation(registry.screenProps[ids[index]]?.stackPresentation)
+    ) {
+      return index;
+    }
+  }
+
+  return -1;
 }
 
 function idsEqual(left: string[], right: string[]) {
@@ -823,6 +973,7 @@ function configureScreenController(
   }
 
   configureHeaderBackButton(controller, props, ctx, isTopScreen);
+  emitHeaderHeightChange(controller, props, ctx);
 }
 
 function configureStackControllers(
@@ -848,18 +999,15 @@ function configureStackControllers(
   }
 }
 
-function emitStackChange(ctx: any, navigationController: any) {
+function emitStackChange(ctx: any) {
   'worklet';
 
-  if (!ctx) {
+  if (!ctx?.props?.stackId) {
     return;
   }
 
   const registry = getRegistry(globalThis as Record<string, any>);
-  const screenIds = navigationControllerScreenIds(
-    navigationController,
-    registry
-  );
+  const screenIds = stackVisibleScreenIds(ctx.props.stackId, registry);
 
   ctx.emit('onNativeStackChange', {
     nativeEvent: {
@@ -868,10 +1016,10 @@ function emitStackChange(ctx: any, navigationController: any) {
   });
 }
 
-function scheduleStackChange(ctx: any, navigationController: any) {
+function scheduleStackChange(ctx: any) {
   'worklet';
 
-  emitStackChange(ctx, navigationController);
+  emitStackChange(ctx);
 
   if (typeof setTimeout !== 'function') {
     return;
@@ -879,7 +1027,7 @@ function scheduleStackChange(ctx: any, navigationController: any) {
 
   const emit = () => {
     'worklet';
-    emitStackChange(ctx, navigationController);
+    emitStackChange(ctx);
   };
 
   setTimeout(emit, 0);
@@ -980,6 +1128,342 @@ function animateStackPop(
   return false;
 }
 
+function setNavigationControllerViewControllers(
+  navigationController: any,
+  controllers: any[],
+  animated: boolean
+) {
+  'worklet';
+
+  if (
+    navigationController &&
+    typeof navigationController.setViewControllersAnimated === 'function'
+  ) {
+    navigationController.setViewControllersAnimated(
+      createArray(controllers),
+      animated
+    );
+  } else if (navigationController) {
+    navigationController.viewControllers = createArray(controllers);
+  }
+}
+
+function finishTransition(
+  stackId: string,
+  registry: NativeScriptStackRegistry,
+  ctx: any,
+  closing: boolean,
+  screenId: string | undefined
+) {
+  'worklet';
+
+  emitTransition(ctx, 'end', closing, screenId);
+  registry.stackTransitioning[stackId] = false;
+  registry.stackTransitionClosing[stackId] = undefined;
+  registry.stackTransitionScreenIds[stackId] = undefined;
+  registry.stackTransitionTokens[stackId] =
+    (registry.stackTransitionTokens[stackId] ?? 0) + 1;
+  scheduleStackChange(ctx);
+}
+
+function configureModalNavigationController(
+  navigationController: any,
+  presentation: unknown
+) {
+  'worklet';
+
+  if (!navigationController) {
+    return;
+  }
+
+  configureExtendedLayout(navigationController);
+  navigationController.modalPresentationStyle =
+    modalPresentationStyle(presentation);
+  navigationController.modalTransitionStyle = modalTransitionStyle();
+}
+
+function rootPresentedTouchView(navigationController: any) {
+  'worklet';
+  const firstController = arrayItem(navigationController?.viewControllers, 0);
+
+  return firstController?.view ?? navigationController?.view;
+}
+
+function attachPresentedReactTouchHandler(
+  stackId: string,
+  registry: NativeScriptStackRegistry,
+  ctx: any,
+  view: any
+) {
+  'worklet';
+
+  void stackId;
+  void registry;
+  void ctx;
+  void view;
+}
+
+function detachPresentedReactTouchHandler(
+  stackId: string,
+  registry: NativeScriptStackRegistry,
+  ctx: any,
+  view: any
+) {
+  'worklet';
+  void stackId;
+  void registry;
+  void ctx;
+  void view;
+}
+
+function createNavigationController(controllers: any[]) {
+  'worklet';
+  const UINavigationController = nativeValue('UINavigationController');
+
+  if (
+    !UINavigationController ||
+    typeof UINavigationController.alloc !== 'function'
+  ) {
+    return null;
+  }
+
+  const allocated = UINavigationController.alloc();
+  const navigationController =
+    allocated && typeof allocated.init === 'function'
+      ? allocated.init()
+      : allocated;
+
+  setNavigationControllerViewControllers(
+    navigationController,
+    controllers,
+    false
+  );
+
+  return navigationController;
+}
+
+function presentModalStack(
+  stackId: string,
+  registry: NativeScriptStackRegistry,
+  ctx: any,
+  parentNavigationController: any,
+  modalIds: string[],
+  modalControllers: any[],
+  animated: boolean
+) {
+  'worklet';
+  const modalNavigationController =
+    createNavigationController(modalControllers);
+  const rootScreenId = modalIds[0];
+  const rootProps = registry.screenProps[rootScreenId];
+
+  if (
+    !modalNavigationController ||
+    !parentNavigationController ||
+    typeof parentNavigationController.presentViewControllerAnimatedCompletion !==
+      'function'
+  ) {
+    return false;
+  }
+
+  configureModalNavigationController(
+    modalNavigationController,
+    rootProps?.stackPresentation
+  );
+  installNativeBackGestureDelegate(modalNavigationController, ctx);
+  attachPresentedReactTouchHandler(
+    stackId,
+    registry,
+    ctx,
+    rootPresentedTouchView(modalNavigationController)
+  );
+  registry.stackModalNavigationControllers[stackId] = modalNavigationController;
+  registry.stackModalKeys[stackId] = idsKey(modalIds);
+
+  configureStackControllers(modalIds, registry);
+  configureNavigationAppearance(
+    modalNavigationController,
+    registry.screenHeaderConfigs[modalIds[modalIds.length - 1]]
+  );
+  markTransition(stackId, registry, ctx, false, rootScreenId);
+  parentNavigationController.presentViewControllerAnimatedCompletion(
+    modalNavigationController,
+    animated,
+    null
+  );
+
+  const complete = () => {
+    'worklet';
+    layoutNavigationStackViews(modalNavigationController);
+    configureStackControllers(modalIds, registry);
+    configureNavigationAppearance(
+      modalNavigationController,
+      registry.screenHeaderConfigs[modalIds[modalIds.length - 1]]
+    );
+    finishTransition(stackId, registry, ctx, false, rootScreenId);
+  };
+
+  if (typeof setTimeout === 'function') {
+    setTimeout(complete, animated ? 360 : 0);
+  } else {
+    complete();
+  }
+
+  return true;
+}
+
+function dismissModalStack(
+  stackId: string,
+  registry: NativeScriptStackRegistry,
+  ctx: any,
+  animated: boolean,
+  closingScreenId: string | undefined
+) {
+  'worklet';
+  const modalNavigationController =
+    registry.stackModalNavigationControllers[stackId];
+
+  if (!modalNavigationController) {
+    return false;
+  }
+
+  markTransition(stackId, registry, ctx, true, closingScreenId);
+
+  if (
+    typeof modalNavigationController.dismissViewControllerAnimatedCompletion ===
+    'function'
+  ) {
+    modalNavigationController.dismissViewControllerAnimatedCompletion(
+      animated,
+      null
+    );
+  } else {
+    const presentingViewController =
+      modalNavigationController.presentingViewController;
+
+    if (
+      !presentingViewController ||
+      typeof presentingViewController.dismissViewControllerAnimatedCompletion !==
+        'function'
+    ) {
+      return false;
+    }
+
+    presentingViewController.dismissViewControllerAnimatedCompletion(
+      animated,
+      null
+    );
+  }
+
+  const complete = () => {
+    'worklet';
+    detachPresentedReactTouchHandler(
+      stackId,
+      registry,
+      ctx,
+      rootPresentedTouchView(modalNavigationController)
+    );
+    registry.stackModalNavigationControllers[stackId] = undefined;
+    registry.stackModalKeys[stackId] = undefined;
+    finishTransition(stackId, registry, ctx, true, closingScreenId);
+  };
+
+  if (typeof setTimeout === 'function') {
+    setTimeout(complete, animated ? 360 : 0);
+  } else {
+    complete();
+  }
+
+  return true;
+}
+
+function reconcilePresentedModalStack(
+  stackId: string,
+  registry: NativeScriptStackRegistry,
+  ctx: any,
+  availableIds: string[],
+  modalIndex: number,
+  animated: boolean
+) {
+  'worklet';
+  const navigationController = registry.stacks[stackId];
+  const baseIds = availableIds.slice(0, modalIndex);
+  const modalIds = availableIds.slice(modalIndex);
+  const base = controllersForIds(baseIds, registry);
+  const modal = controllersForIds(modalIds, registry);
+
+  if (
+    !navigationController ||
+    base.availableIds.length !== baseIds.length ||
+    modal.availableIds.length !== modalIds.length
+  ) {
+    return false;
+  }
+
+  const baseNativeIds = navigationControllerScreenIds(
+    navigationController,
+    registry
+  );
+
+  if (!idsEqual(baseNativeIds, baseIds)) {
+    setNavigationControllerViewControllers(
+      navigationController,
+      base.controllers,
+      false
+    );
+  }
+
+  layoutNavigationStackViews(navigationController);
+  configureStackControllers(baseIds, registry);
+  configureNavigationAppearance(
+    navigationController,
+    registry.screenHeaderConfigs[baseIds[baseIds.length - 1]]
+  );
+
+  const modalKey = idsKey(modalIds);
+  const modalNavigationController =
+    registry.stackModalNavigationControllers[stackId];
+
+  registry.stackNativeKeys[stackId] = idsKey(availableIds);
+  registry.stackNativeCounts[stackId] = availableIds.length;
+
+  if (!modalNavigationController) {
+    return presentModalStack(
+      stackId,
+      registry,
+      ctx,
+      navigationController,
+      modalIds,
+      modal.controllers,
+      animated
+    );
+  }
+
+  const modalNativeIds = navigationControllerScreenIds(
+    modalNavigationController,
+    registry
+  );
+
+  if (!idsEqual(modalNativeIds, modalIds)) {
+    setNavigationControllerViewControllers(
+      modalNavigationController,
+      modal.controllers,
+      animated
+    );
+  }
+
+  registry.stackModalKeys[stackId] = modalKey;
+  layoutNavigationStackViews(modalNavigationController);
+  configureStackControllers(modalIds, registry);
+  configureNavigationAppearance(
+    modalNavigationController,
+    registry.screenHeaderConfigs[modalIds[modalIds.length - 1]]
+  );
+  scheduleStackChange(ctx);
+
+  return true;
+}
+
 function reconcileStack(
   stackId: string,
   registry: NativeScriptStackRegistry,
@@ -1008,6 +1492,45 @@ function reconcileStack(
     navigationController,
     registry
   );
+  const modalIndex = firstModalIndex(availableIds, registry);
+
+  if (modalIndex > 0) {
+    if (
+      reconcilePresentedModalStack(
+        stackId,
+        registry,
+        ctx,
+        availableIds,
+        modalIndex,
+        animated
+      )
+    ) {
+      return;
+    }
+  }
+
+  if (registry.stackModalNavigationControllers[stackId]) {
+    if (didChange) {
+      registry.stackNativeKeys[stackId] = nextKey;
+      registry.stackNativeCounts[stackId] = nextCount;
+    }
+
+    const modalIds = idsFromKey(registry.stackModalKeys[stackId]);
+    const closingScreenId =
+      modalIds[modalIds.length - 1] ?? previousIds[previousIds.length - 1];
+
+    if (dismissModalStack(stackId, registry, ctx, animated, closingScreenId)) {
+      layoutNavigationStackViews(navigationController);
+      configureStackControllers(availableIds, registry);
+      configureNavigationAppearance(
+        navigationController,
+        registry.screenHeaderConfigs[availableIds[nextCount - 1]]
+      );
+      updateNativeBackGesture(navigationController);
+
+      return;
+    }
+  }
 
   if (!didChange && idsEqual(nativeIds, availableIds)) {
     updateNativeBackGesture(navigationController);
@@ -1044,14 +1567,14 @@ function reconcileStack(
       const pushedScreenId = availableIds[nextCount - 1];
 
       markTransition(stackId, registry, ctx, false, pushedScreenId);
+      configureScreenController(
+        controllers[nextCount - 1],
+        registry.screenProps[pushedScreenId]!,
+        registry.screenContexts[pushedScreenId],
+        true
+      );
 
       if (animateStackPush(navigationController, controllers[nextCount - 1])) {
-        layoutNavigationStackViews(navigationController);
-        configureStackControllers(availableIds, registry);
-        configureNavigationAppearance(
-          navigationController,
-          registry.screenHeaderConfigs[availableIds[nextCount - 1]]
-        );
         updateNativeBackGesture(navigationController);
 
         return;
@@ -1066,6 +1589,12 @@ function reconcileStack(
       const poppedScreenId = previousIds[nextCount];
 
       markTransition(stackId, registry, ctx, true, poppedScreenId);
+      configureScreenController(
+        controllers[nextCount - 1],
+        registry.screenProps[availableIds[nextCount - 1]]!,
+        registry.screenContexts[availableIds[nextCount - 1]],
+        true
+      );
 
       if (
         animateStackPop(
@@ -1075,12 +1604,6 @@ function reconcileStack(
           previousCount
         )
       ) {
-        layoutNavigationStackViews(navigationController);
-        configureStackControllers(availableIds, registry);
-        configureNavigationAppearance(
-          navigationController,
-          registry.screenHeaderConfigs[availableIds[nextCount - 1]]
-        );
         updateNativeBackGesture(navigationController);
 
         return;
@@ -1092,14 +1615,11 @@ function reconcileStack(
     }
   }
 
-  if (typeof navigationController.setViewControllersAnimated === 'function') {
-    navigationController.setViewControllersAnimated(
-      createArray(controllers),
-      false
-    );
-  } else {
-    navigationController.viewControllers = createArray(controllers);
-  }
+  setNavigationControllerViewControllers(
+    navigationController,
+    controllers,
+    false
+  );
 
   layoutNavigationStackViews(navigationController);
   configureStackControllers(availableIds, registry);
@@ -1249,7 +1769,7 @@ const NativeScriptStackController = NativeScriptRuntime.defineUIViewController<
           navigationController,
           registry.screenHeaderConfigs[screenId]
         );
-        scheduleStackChange(ctx, navigationController);
+        scheduleStackChange(ctx);
         const wasClosing =
           registry.stackTransitionClosing[ctx.props.stackId] === true;
 
@@ -1312,6 +1832,14 @@ const NativeScriptStackController = NativeScriptRuntime.defineUIViewController<
       return;
     }
 
+    const modalNavigationController =
+      registry.stackModalNavigationControllers[props.stackId];
+    detachPresentedReactTouchHandler(
+      props.stackId,
+      registry,
+      registry.stackContexts[props.stackId],
+      rootPresentedTouchView(modalNavigationController)
+    );
     registry.stacks[props.stackId] = undefined;
     registry.stackContexts[props.stackId] = undefined;
     registry.stackActiveScreenIds[props.stackId] = undefined;
@@ -1321,6 +1849,8 @@ const NativeScriptStackController = NativeScriptRuntime.defineUIViewController<
     registry.stackTransitionClosing[props.stackId] = undefined;
     registry.stackTransitionScreenIds[props.stackId] = undefined;
     registry.stackTransitionTokens[props.stackId] = undefined;
+    registry.stackModalNavigationControllers[props.stackId] = undefined;
+    registry.stackModalKeys[props.stackId] = undefined;
   },
 });
 
@@ -1622,21 +2152,6 @@ export const NativeScriptScreenStackItem = React.forwardRef<
       {children}
     </View>
   );
-
-  React.useEffect(() => {
-    if (headerConfig?.hidden === true) {
-      return;
-    }
-
-    if (typeof onHeaderHeightChange === 'function') {
-      onHeaderHeightChange({
-        nativeEvent: {
-          headerHeight:
-            Platform.OS === 'ios' && stackPresentation !== 'push' ? 56 : 44,
-        },
-      } as Parameters<NonNullable<ScreenProps['onHeaderHeightChange']>>[0]);
-    }
-  }, [headerConfig?.hidden, onHeaderHeightChange, stackPresentation]);
 
   React.useLayoutEffect(() => {
     if (!stackContext) {
