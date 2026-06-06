@@ -1032,21 +1032,38 @@ export function repairNativeScriptStackAfterDismiss(screenId: string) {
         return 'missing-stack';
       }
 
+      if (registry.stackModalNavigationControllers[stackId]) {
+        return 'modal-active';
+      }
+
       const activeIds = registry.stackActiveScreenIds[stackId] ?? [];
-      const target = controllersForIds(activeIds, registry);
+      const baseIds = activeIds.filter(
+        (screenId) =>
+          !isModalPresentation(
+            registry.screenProps[screenId]?.stackPresentation
+          )
+      );
+      const target = controllersForIds(baseIds, registry);
+      const nativeIds = navigationControllerScreenIds(
+        navigationController,
+        registry
+      );
 
       if (
         target.availableIds.length === 0 ||
-        target.availableIds.length !== activeIds.length
+        target.availableIds.length !== baseIds.length
       ) {
         return 'missing-controllers';
       }
 
-      setNavigationControllerViewControllers(
-        navigationController,
-        target.controllers,
-        false
-      );
+      if (!idsEqual(nativeIds, target.availableIds)) {
+        setNavigationControllerViewControllers(
+          navigationController,
+          target.controllers,
+          false
+        );
+      }
+
       registry.stackNativeKeys[stackId] = idsKey(target.availableIds);
       registry.stackNativeCounts[stackId] = target.availableIds.length;
       layoutNavigationStackViews(navigationController);
@@ -1210,6 +1227,40 @@ function controllersThroughIndex(viewControllers: any, targetIndex: number) {
   }
 
   return controllers;
+}
+
+function viewControllersEqual(viewControllers: any, controllers: any[]) {
+  'worklet';
+  const count = arrayCount(viewControllers);
+
+  if (count !== controllers.length) {
+    return false;
+  }
+
+  for (let index = 0; index < count; index += 1) {
+    if (arrayItem(viewControllers, index) !== controllers[index]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function viewControllersMatchPrefix(viewControllers: any, controllers: any[]) {
+  'worklet';
+  const count = arrayCount(viewControllers);
+
+  if (count > controllers.length) {
+    return false;
+  }
+
+  for (let index = 0; index < count; index += 1) {
+    if (arrayItem(viewControllers, index) !== controllers[index]) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 function rectWithY(rect: any, y: number) {
@@ -1677,41 +1728,29 @@ function setNavigationControllerViewControllers(
   const nativeControllers = createArray(controllers);
 
   if (navigationController && !animated) {
-    const currentCount = arrayCount(navigationController.viewControllers);
+    const currentViewControllers = navigationController.viewControllers;
+    const currentCount = arrayCount(currentViewControllers);
 
-    if (
-      controllers.length > 1 &&
-      typeof navigationController.pushViewControllerAnimated === 'function'
-    ) {
-      const rootControllers = createArray([controllers[0]]);
-
-      if (
-        typeof navigationController.setViewControllersAnimated === 'function'
-      ) {
-        navigationController.setViewControllersAnimated(rootControllers, false);
-      }
-
-      navigationController.viewControllers = rootControllers;
-
-      for (let index = 1; index < controllers.length; index += 1) {
-        const controller = controllers[index];
-
-        if (controller) {
-          navigationController.pushViewControllerAnimated(controller, false);
-        }
-      }
-
+    if (viewControllersEqual(currentViewControllers, controllers)) {
       return;
     }
 
     if (
       controllers.length > currentCount &&
+      currentCount > 0 &&
+      viewControllersMatchPrefix(currentViewControllers, controllers) &&
       typeof navigationController.pushViewControllerAnimated === 'function'
     ) {
-      for (let index = currentCount; index < controllers.length; index += 1) {
+      for (let index = 1; index < controllers.length; index += 1) {
         const controller = controllers[index];
 
-        if (controller) {
+        if (
+          controller &&
+          !navigationControllerContainsController(
+            navigationController,
+            controller
+          )
+        ) {
           navigationController.pushViewControllerAnimated(controller, false);
         }
       }
@@ -1817,11 +1856,19 @@ function scheduleTransitionFallback(
       target.availableIds.length > 0 &&
       target.availableIds.length === targetIds.length
     ) {
-      setNavigationControllerViewControllers(
+      const currentIds = navigationControllerScreenIds(
         navigationController,
-        target.controllers,
-        false
+        registry
       );
+
+      if (!idsEqual(currentIds, target.availableIds)) {
+        setNavigationControllerViewControllers(
+          navigationController,
+          target.controllers,
+          false
+        );
+      }
+
       registry.stackNativeKeys[stackId] = idsKey(target.availableIds);
       registry.stackNativeCounts[stackId] = target.availableIds.length;
       layoutNavigationStackViews(navigationController);
@@ -2187,6 +2234,22 @@ function dismissModalStack(
   return true;
 }
 
+function controllerHasReactContent(controller: any) {
+  'worklet';
+  const subviews = controller?.view?.subviews;
+  const count = arrayCount(subviews);
+
+  for (let index = 0; index < count; index += 1) {
+    const subview = arrayItem(subviews, index);
+
+    if (subview && subview.hidden !== true) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function reconcilePresentedModalStack(
   stackId: string,
   registry: NativeScriptStackRegistry,
@@ -2234,11 +2297,15 @@ function reconcilePresentedModalStack(
   const modalNavigationController =
     registry.stackModalNavigationControllers[stackId];
 
-  registry.stackNativeKeys[stackId] = idsKey(availableIds);
-  registry.stackNativeCounts[stackId] = availableIds.length;
-
   if (!modalNavigationController) {
-    if (arrayCount(modal.controllers[0]?.view?.subviews) === 0) {
+    const pendingRetries = registry.stackPendingContentRetries[stackId] ?? 0;
+
+    if (pendingRetries < 2) {
+      registry.stackPendingContentRetries[stackId] = pendingRetries + 1;
+      return true;
+    }
+
+    if (!controllerHasReactContent(modal.controllers[0])) {
       const retries = registry.stackPendingContentRetries[stackId] ?? 0;
 
       if (retries < 12) {
@@ -2251,7 +2318,7 @@ function reconcilePresentedModalStack(
       registry.stackPendingContentRetries[stackId] = undefined;
     }
 
-    return presentModalStack(
+    const didPresent = presentModalStack(
       stackId,
       registry,
       ctx,
@@ -2260,6 +2327,13 @@ function reconcilePresentedModalStack(
       modal.controllers,
       animated
     );
+
+    if (didPresent) {
+      registry.stackNativeKeys[stackId] = idsKey(availableIds);
+      registry.stackNativeCounts[stackId] = availableIds.length;
+    }
+
+    return didPresent;
   }
 
   const modalNativeIds = navigationControllerScreenIds(
@@ -2276,6 +2350,8 @@ function reconcilePresentedModalStack(
   }
 
   registry.stackModalKeys[stackId] = modalKey;
+  registry.stackNativeKeys[stackId] = idsKey(availableIds);
+  registry.stackNativeCounts[stackId] = availableIds.length;
   layoutNavigationStackViews(modalNavigationController);
   configureStackControllers(modalIds, registry);
   configureNavigationAppearance(
@@ -2287,25 +2363,23 @@ function reconcilePresentedModalStack(
   return true;
 }
 
-function controllerHasReactContent(controller: any) {
-  'worklet';
-
-  return arrayCount(controller?.view?.subviews) > 0;
-}
-
 function shouldDelayPushUntilControllerHasContent(
   stackId: string,
   registry: NativeScriptStackRegistry,
   controller: any
 ) {
   'worklet';
+  const retries = registry.stackPendingContentRetries[stackId] ?? 0;
+
+  if (retries < 2) {
+    registry.stackPendingContentRetries[stackId] = retries + 1;
+    return true;
+  }
 
   if (controllerHasReactContent(controller)) {
     registry.stackPendingContentRetries[stackId] = undefined;
     return false;
   }
-
-  const retries = registry.stackPendingContentRetries[stackId] ?? 0;
 
   if (retries >= 4) {
     registry.stackPendingContentRetries[stackId] = undefined;
@@ -2368,16 +2442,16 @@ function reconcileStack(
   }
 
   if (registry.stackModalNavigationControllers[stackId]) {
-    if (didChange) {
-      registry.stackNativeKeys[stackId] = nextKey;
-      registry.stackNativeCounts[stackId] = nextCount;
-    }
-
     const modalIds = idsFromKey(registry.stackModalKeys[stackId]);
     const closingScreenId =
       modalIds[modalIds.length - 1] ?? previousIds[previousIds.length - 1];
 
     if (dismissModalStack(stackId, registry, ctx, animated, closingScreenId)) {
+      if (didChange) {
+        registry.stackNativeKeys[stackId] = nextKey;
+        registry.stackNativeCounts[stackId] = nextCount;
+      }
+
       layoutNavigationStackViews(navigationController);
       configureStackControllers(availableIds, registry);
       configureNavigationAppearance(
@@ -2399,11 +2473,6 @@ function reconcileStack(
       registry.screenHeaderConfigs[availableIds[nextCount - 1]]
     );
     return;
-  }
-
-  if (didChange) {
-    registry.stackNativeKeys[stackId] = nextKey;
-    registry.stackNativeCounts[stackId] = nextCount;
   }
 
   if (animated && previousKey != null && previousCount > 0) {
@@ -2435,6 +2504,8 @@ function reconcileStack(
         return;
       }
 
+      registry.stackPendingContentRetries[stackId] = undefined;
+
       const token = markTransition(
         stackId,
         registry,
@@ -2457,6 +2528,8 @@ function reconcileStack(
       }
 
       if (animateStackPush(navigationController, pushedController)) {
+        registry.stackNativeKeys[stackId] = nextKey;
+        registry.stackNativeCounts[stackId] = nextCount;
         updateNativeBackGesture(navigationController);
         scheduleTransitionFallback(
           stackId,
@@ -2498,6 +2571,8 @@ function reconcileStack(
           previousCount
         )
       ) {
+        registry.stackNativeKeys[stackId] = nextKey;
+        registry.stackNativeCounts[stackId] = nextCount;
         updateNativeBackGesture(navigationController);
         scheduleTransitionFallback(
           stackId,
@@ -2526,6 +2601,8 @@ function reconcileStack(
     controllers,
     false
   );
+  registry.stackNativeKeys[stackId] = nextKey;
+  registry.stackNativeCounts[stackId] = nextCount;
 
   layoutNavigationStackViews(navigationController);
   configureStackControllers(availableIds, registry);
@@ -3166,6 +3243,8 @@ export const NativeScriptScreenStackItem = React.forwardRef<
   );
   const lastLayoutSignatureRef = React.useRef<string | null>(null);
   const onLayoutProp = rest.onLayout;
+  const shouldAttachControllerView =
+    stackPresentation != null && stackPresentation !== 'push';
 
   registeredPropsRef.current = {
     ...rest,
@@ -3263,8 +3342,8 @@ export const NativeScriptScreenStackItem = React.forwardRef<
   return (
     <NativeScriptScreenController
       {...rest}
-      attachController
-      attachControllerView={false}
+      attachController={false}
+      attachControllerView={shouldAttachControllerView}
       attachNativeView={false}
       contentStyle={contentStyle}
       headerConfig={headerConfig}

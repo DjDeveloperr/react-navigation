@@ -6,10 +6,7 @@ import {
   HeaderShownContext,
   useFrameSize,
 } from '@react-navigation/elements';
-import {
-  ActivityView,
-  SafeAreaProviderCompat,
-} from '@react-navigation/elements/internal';
+import { SafeAreaProviderCompat } from '@react-navigation/elements/internal';
 import {
   NavigationProvider,
   type ParamListBase,
@@ -580,9 +577,7 @@ const SceneView = ({
         unstable_sheetFooter={unstable_sheetFooter}
       >
         {activityMode === 'unmounted' ? null : (
-          <ActivityView mode={activityMode} visible style={styles.content}>
-            {content}
-          </ActivityView>
+          <View style={styles.content}>{content}</View>
         )}
       </ScreenStackItem>
     </NavigationProvider>
