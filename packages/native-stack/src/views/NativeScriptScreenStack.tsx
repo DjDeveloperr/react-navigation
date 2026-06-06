@@ -1,6 +1,7 @@
 import * as NativeScriptRuntime from '@nativescript/react-native';
 import * as React from 'react';
 import {
+  type LayoutChangeEvent,
   type StyleProp,
   StyleSheet,
   View,
@@ -15,6 +16,7 @@ import type {
 const REGISTRY_KEY = '__reactNavigationNativeScriptStackRegistry';
 const MOUNT_VIEW_TAG = 82734091;
 const BACK_BUTTON_TAG = 82734092;
+const MODAL_VIEW_TAG = 82734093;
 const SCREEN_ID_SEPARATOR = '\u001f';
 
 let nextStackId = 0;
@@ -28,12 +30,17 @@ type NativeScriptStackRegistry = {
   stackNativeCounts: Record<string, number | undefined>;
   stackTransitioning: Record<string, boolean | undefined>;
   stackTransitionClosing: Record<string, boolean | undefined>;
+  stackTransitionNativeDriven: Record<string, boolean | undefined>;
   stackTransitionScreenIds: Record<string, string | undefined>;
   stackTransitionTokens: Record<string, number | undefined>;
+  stackPendingContentRetries: Record<string, number | undefined>;
   stackModalNavigationControllers: Record<string, any>;
   stackModalKeys: Record<string, string | undefined>;
+  stackModalPresentedModally: Record<string, boolean | undefined>;
+  stackModalDismissRequestedFromJS: Record<string, boolean | undefined>;
   screenHeaderConfigs: Record<string, ScreenStackHeaderConfigProps | undefined>;
   screenContexts: Record<string, any>;
+  screenControllerHashes: Record<string, number | string | undefined>;
   screenParents: Record<string, string | undefined>;
   screenProps: Record<string, NativeScriptScreenStackItemProps | undefined>;
 };
@@ -66,6 +73,7 @@ type NativeScriptScreenStackItemProps = Omit<
   ViewProps & {
     contentStyle?: StyleProp<ViewStyle>;
     headerConfig?: ScreenStackHeaderConfigProps | undefined;
+    nativeScriptContentRevision?: number;
     parentId?: string;
     screenId: string;
   };
@@ -108,12 +116,17 @@ function getRegistry(
     stackNativeCounts: {},
     stackTransitioning: {},
     stackTransitionClosing: {},
+    stackTransitionNativeDriven: {},
     stackTransitionScreenIds: {},
     stackTransitionTokens: {},
+    stackPendingContentRetries: {},
     stackModalNavigationControllers: {},
     stackModalKeys: {},
+    stackModalPresentedModally: {},
+    stackModalDismissRequestedFromJS: {},
     screenHeaderConfigs: {},
     screenContexts: {},
+    screenControllerHashes: {},
     screenParents: {},
     screenProps: {},
   };
@@ -218,34 +231,6 @@ function plainBarButtonStyle() {
   return style?.Plain ?? style?.plain ?? 0;
 }
 
-function touchUpInsideControlEvent() {
-  'worklet';
-  const events = nativeValue('UIControlEvents');
-
-  return (
-    events?.TouchUpInside ??
-    events?.touchUpInside ??
-    nativeValue('UIControlEventTouchUpInside') ??
-    64
-  );
-}
-
-function systemButtonType() {
-  'worklet';
-  const type = nativeValue('UIButtonType');
-
-  return type?.System ?? type?.system ?? 1;
-}
-
-function normalControlState() {
-  'worklet';
-  const state = nativeValue('UIControlState');
-
-  return (
-    state?.Normal ?? state?.normal ?? nativeValue('UIControlStateNormal') ?? 0
-  );
-}
-
 function modalPresentationStyle(presentation: unknown) {
   'worklet';
   const style = nativeValue('UIModalPresentationStyle');
@@ -266,7 +251,7 @@ function modalPresentationStyle(presentation: unknown) {
     return style?.FormSheet ?? style?.formSheet ?? 2;
   }
 
-  return style?.FullScreen ?? style?.fullScreen ?? 0;
+  return style?.OverFullScreen ?? style?.overFullScreen ?? 5;
 }
 
 function modalTransitionStyle() {
@@ -282,13 +267,6 @@ function isModalPresentation(presentation: unknown) {
   return Boolean(
     presentation && presentation !== 'push' && presentation !== 'card'
   );
-}
-
-function leftContentAlignment() {
-  'worklet';
-  const alignment = nativeValue('UIControlContentHorizontalAlignment');
-
-  return alignment?.Left ?? alignment?.left ?? 1;
 }
 
 function configureExtendedLayout(controller: any) {
@@ -349,6 +327,36 @@ function arrayItem(value: any, index: number) {
   }
 
   return value[index] ?? null;
+}
+
+function removeTaggedSubviews(rootView: any, tag: number) {
+  'worklet';
+
+  if (!rootView) {
+    return;
+  }
+
+  const subviews = rootView.subviews;
+  const count = arrayCount(subviews);
+
+  for (let index = count - 1; index >= 0; index -= 1) {
+    const subview = arrayItem(subviews, index);
+
+    if (!subview) {
+      continue;
+    }
+
+    removeTaggedSubviews(subview, tag);
+
+    if (
+      subview.tag === tag &&
+      typeof subview.removeFromSuperview === 'function'
+    ) {
+      subview.userInteractionEnabled = false;
+      subview.hidden = true;
+      subview.removeFromSuperview();
+    }
+  }
 }
 
 function flexibleSizeMask() {
@@ -492,98 +500,82 @@ function layoutNavigationStackViews(navigationController: any) {
 function configureHeaderBackButton(
   controller: any,
   props: Readonly<NativeScriptScreenStackItemProps>,
-  ctx: any,
-  isTopScreen: boolean
+  isTopScreen: boolean,
+  canGoBack: boolean
 ) {
   'worklet';
-  const navigationController = controller?.navigationController;
   const navigationItem = controller?.navigationItem;
 
-  if (!navigationController || !navigationItem) {
+  if (!navigationItem) {
     return;
   }
 
-  const viewControllers = navigationController.viewControllers;
-  const count = arrayCount(viewControllers);
   const existingItem = navigationItem.leftBarButtonItem;
   const existingButton = existingItem?.customView;
   const hasNativeScriptBackButton = existingButton?.tag === BACK_BUTTON_TAG;
-  const isModalRoot =
-    count === 1 && isModalPresentation(props.stackPresentation);
   const shouldShowBackButton =
-    (count > 1 || isModalRoot) &&
-    isTopScreen &&
-    props.headerConfig?.hideBackButton !== true &&
-    typeof props.onHeaderBackButtonClicked === 'function';
-
-  if (!shouldShowBackButton) {
-    if (hasNativeScriptBackButton) {
-      navigationItem.leftBarButtonItem = null;
-    }
-    navigationItem.hidesBackButton =
-      props.headerConfig?.hideBackButton === true;
-    return;
-  }
-
-  navigationItem.hidesBackButton = true;
+    canGoBack && isTopScreen && props.headerConfig?.hideBackButton !== true;
 
   if (hasNativeScriptBackButton) {
+    navigationItem.leftBarButtonItem = null;
+  }
+
+  navigationItem.hidesBackButton = !shouldShowBackButton;
+}
+
+function configureSourceBackButton(
+  navigationItem: any,
+  headerConfig?: ScreenStackHeaderConfigProps
+) {
+  'worklet';
+
+  if (!navigationItem) {
     return;
   }
 
-  const UIButton = nativeValue('UIButton');
+  const displayMode =
+    headerConfig?.backTitleVisible === false
+      ? 'minimal'
+      : headerConfig?.backButtonDisplayMode;
+  const title =
+    headerConfig?.backTitleVisible === false || displayMode === 'minimal'
+      ? ''
+      : headerConfig?.backTitle;
+
+  navigationItem.backButtonDisplayMode = backButtonDisplayMode(displayMode);
+  navigationItem.backButtonTitle = title ?? '';
+
+  const existingItem = navigationItem.backBarButtonItem;
+
+  if (existingItem?.accessibilityLabel === 'Back') {
+    existingItem.title = title ?? '';
+    existingItem.style = plainBarButtonStyle();
+    return;
+  }
+
   const UIBarButtonItem = nativeValue('UIBarButtonItem');
 
-  if (
-    !ctx ||
-    !UIButton ||
-    typeof UIButton.buttonWithType !== 'function' ||
-    !UIBarButtonItem ||
-    typeof UIBarButtonItem.alloc !== 'function'
-  ) {
+  if (!UIBarButtonItem || typeof UIBarButtonItem.alloc !== 'function') {
     return;
   }
-
-  const button = UIButton.buttonWithType(systemButtonType());
-
-  button.tag = BACK_BUTTON_TAG;
-  button.accessibilityLabel = 'Back';
-  button.contentHorizontalAlignment = leftContentAlignment();
-
-  const CGRectMake = nativeValue('CGRectMake');
-  button.frame =
-    typeof CGRectMake === 'function'
-      ? CGRectMake(0, 0, 44, 44)
-      : { origin: { x: 0, y: 0 }, size: { width: 44, height: 44 } };
-
-  const UIImage = nativeValue('UIImage');
-  const chevron =
-    UIImage && typeof UIImage.systemImageNamed === 'function'
-      ? UIImage.systemImageNamed('chevron.backward')
-      : null;
-
-  if (chevron && typeof button.setImageForState === 'function') {
-    button.setImageForState(chevron, normalControlState());
-  } else if (typeof button.setTitleForState === 'function') {
-    button.setTitleForState('‹', normalControlState());
-  }
-
-  ctx.targetAction(button, touchUpInsideControlEvent(), () => {
-    'worklet';
-    ctx.emit('onHeaderBackButtonClicked', {
-      nativeEvent: {},
-    });
-  });
 
   const allocatedItem = UIBarButtonItem.alloc();
   const item =
-    allocatedItem && typeof allocatedItem.initWithCustomView === 'function'
-      ? allocatedItem.initWithCustomView(button)
+    allocatedItem &&
+    typeof allocatedItem.initWithTitleStyleTargetAction === 'function'
+      ? allocatedItem.initWithTitleStyleTargetAction(
+          '',
+          plainBarButtonStyle(),
+          null,
+          null
+        )
       : allocatedItem;
 
   if (item) {
+    item.title = title ?? '';
     item.style = plainBarButtonStyle();
-    navigationItem.leftBarButtonItem = item;
+    item.accessibilityLabel = 'Back';
+    navigationItem.backBarButtonItem = item;
   }
 }
 
@@ -631,11 +623,69 @@ function emitHeaderHeightChange(
   });
 }
 
+function clearScreenRecord(
+  registry: NativeScriptStackRegistry,
+  screenId: string
+) {
+  'worklet';
+
+  registry.screens[screenId] = undefined;
+  registry.screenHeaderConfigs[screenId] = undefined;
+  registry.screenContexts[screenId] = undefined;
+  registry.screenControllerHashes[screenId] = undefined;
+  registry.screenParents[screenId] = undefined;
+  registry.screenProps[screenId] = undefined;
+}
+
+function controllerHash(controller: any) {
+  'worklet';
+
+  const hash = controller?.hash;
+
+  return typeof hash === 'number' || typeof hash === 'string'
+    ? hash
+    : undefined;
+}
+
+function setScreenControllerIdentity(controller: any, screenId: string) {
+  'worklet';
+
+  if (!controller) {
+    return;
+  }
+
+  controller.__nativeScriptScreenId = screenId;
+  controller.restorationIdentifier = screenId;
+
+  if (controller.view) {
+    controller.view.accessibilityIdentifier = screenId;
+  }
+}
+
 function screenIdForController(
   controller: any,
   registry: NativeScriptStackRegistry
 ) {
   'worklet';
+
+  const taggedScreenId =
+    controller?.__nativeScriptScreenId ??
+    controller?.restorationIdentifier ??
+    controller?.view?.accessibilityIdentifier;
+
+  if (typeof taggedScreenId === 'string' && registry.screens[taggedScreenId]) {
+    return taggedScreenId;
+  }
+
+  const hash = controllerHash(controller);
+
+  if (hash != null) {
+    for (const screenId in registry.screenControllerHashes) {
+      if (registry.screenControllerHashes[screenId] === hash) {
+        return screenId;
+      }
+    }
+  }
 
   for (const screenId in registry.screens) {
     if (registry.screens[screenId] === controller) {
@@ -644,6 +694,379 @@ function screenIdForController(
   }
 
   return undefined;
+}
+
+function navigationControllerContainsController(
+  navigationController: any,
+  controller: any
+) {
+  'worklet';
+
+  if (!navigationController || !controller) {
+    return false;
+  }
+
+  const viewControllers = navigationController.viewControllers;
+  const count = arrayCount(viewControllers);
+
+  for (let index = 0; index < count; index += 1) {
+    if (arrayItem(viewControllers, index) === controller) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function screenIdInList(screenId: string, ids: string[]) {
+  'worklet';
+
+  for (const id of ids) {
+    if (id === screenId) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function screenControllerIsVisibleInNativeStack(
+  stackId: string,
+  controller: any,
+  registry: NativeScriptStackRegistry
+) {
+  'worklet';
+
+  return (
+    navigationControllerContainsController(
+      registry.stacks[stackId],
+      controller
+    ) ||
+    navigationControllerContainsController(
+      registry.stackModalNavigationControllers[stackId],
+      controller
+    )
+  );
+}
+
+function cleanupDetachedScreens(
+  stackId: string,
+  registry: NativeScriptStackRegistry
+) {
+  'worklet';
+
+  const activeIds = registry.stackActiveScreenIds[stackId] ?? [];
+
+  for (const screenId in registry.screens) {
+    if (registry.screenParents[screenId] !== stackId) {
+      continue;
+    }
+
+    if (screenIdInList(screenId, activeIds)) {
+      continue;
+    }
+
+    if (
+      screenControllerIsVisibleInNativeStack(
+        stackId,
+        registry.screens[screenId],
+        registry
+      )
+    ) {
+      continue;
+    }
+
+    clearScreenRecord(registry, screenId);
+  }
+}
+
+export function requestNativeScriptStackPop(screenId: string, count = 1) {
+  return (NativeScriptRuntime as any)
+    .runOnUI(
+      (targetScreenId: string, requestedCount: number) => {
+        'worklet';
+        const registry = (globalThis as Record<string, any>)[REGISTRY_KEY] as
+          | NativeScriptStackRegistry
+          | undefined;
+
+        if (!registry) {
+          return 'no-registry';
+        }
+
+        const controller = registry.screens[targetScreenId];
+        const stackId = registry.screenParents[targetScreenId];
+        const navigationController = stackId ? registry.stacks[stackId] : null;
+
+        if (!stackId || !controller || !navigationController) {
+          return 'missing-stack';
+        }
+
+        if (registry.stackTransitioning[stackId]) {
+          return 'transitioning';
+        }
+
+        const ctx = registry.stackContexts[stackId];
+        const modalNavigationController =
+          registry.stackModalNavigationControllers[stackId];
+        const targetIsPresentedModal = isModalPresentation(
+          registry.screenProps[targetScreenId]?.stackPresentation
+        );
+        if (
+          modalNavigationController &&
+          (targetIsPresentedModal ||
+            navigationControllerContainsController(
+              modalNavigationController,
+              controller
+            ))
+        ) {
+          const modalViewControllers =
+            modalNavigationController.viewControllers;
+          const modalCount = arrayCount(modalViewControllers);
+          const modalPopCount = Math.max(
+            1,
+            Math.min(Math.floor(requestedCount || 1), modalCount)
+          );
+          const topModalController = arrayItem(
+            modalViewControllers,
+            modalCount - 1
+          );
+          const closingModalScreenId =
+            screenIdForController(topModalController, registry) ??
+            targetScreenId;
+
+          if (modalCount > 1 && modalPopCount < modalCount) {
+            const targetIndex = Math.max(0, modalCount - modalPopCount - 1);
+            const targetController = arrayItem(
+              modalViewControllers,
+              targetIndex
+            );
+            const targetControllers = controllersThroughIndex(
+              modalViewControllers,
+              targetIndex
+            );
+
+            markTransition(
+              stackId,
+              registry,
+              ctx,
+              true,
+              closingModalScreenId,
+              true
+            );
+
+            if (
+              modalPopCount === 1 &&
+              typeof modalNavigationController.popViewControllerAnimated ===
+                'function'
+            ) {
+              modalNavigationController.popViewControllerAnimated(true);
+              updateNativeBackGesture(modalNavigationController);
+              return 'ok';
+            }
+
+            if (
+              targetController &&
+              typeof modalNavigationController.popToViewControllerAnimated ===
+                'function'
+            ) {
+              modalNavigationController.popToViewControllerAnimated(
+                targetController,
+                true
+              );
+              updateNativeBackGesture(modalNavigationController);
+              return 'ok';
+            }
+
+            if (
+              targetControllers.length > 0 &&
+              typeof modalNavigationController.setViewControllersAnimated ===
+                'function'
+            ) {
+              modalNavigationController.setViewControllersAnimated(
+                createArray(targetControllers),
+                true
+              );
+              updateNativeBackGesture(modalNavigationController);
+              return 'ok';
+            }
+
+            finishTransition(
+              stackId,
+              registry,
+              ctx,
+              true,
+              closingModalScreenId
+            );
+          }
+
+          registry.stackModalDismissRequestedFromJS[stackId] = true;
+
+          return dismissModalStack(
+            stackId,
+            registry,
+            ctx,
+            true,
+            closingModalScreenId
+          )
+            ? 'ok-modal'
+            : 'unsupported';
+        }
+
+        const viewControllers = navigationController.viewControllers;
+        const nativeCount = arrayCount(viewControllers);
+
+        if (nativeCount <= 1) {
+          return 'at-root';
+        }
+
+        const popCount = Math.max(
+          1,
+          Math.min(Math.floor(requestedCount || 1), nativeCount - 1)
+        );
+        const targetIndex = Math.max(0, nativeCount - popCount - 1);
+        const targetController = arrayItem(viewControllers, targetIndex);
+        const targetControllers = controllersThroughIndex(
+          viewControllers,
+          targetIndex
+        );
+        const activeIds = registry.stackActiveScreenIds[stackId] ?? [];
+        const nativeIds = navigationControllerScreenIds(
+          navigationController,
+          registry
+        );
+        const targetScreenIds =
+          activeIds.length > popCount
+            ? activeIds.slice(0, activeIds.length - popCount)
+            : nativeIds.length > popCount
+              ? nativeIds.slice(0, nativeIds.length - popCount)
+              : nativeIds.slice(0, targetIndex + 1);
+        const closingScreenId =
+          activeIds[activeIds.length - 1] ??
+          screenIdForController(
+            arrayItem(viewControllers, nativeCount - 1),
+            registry
+          ) ??
+          targetScreenId;
+        const token = markTransition(
+          stackId,
+          registry,
+          ctx,
+          true,
+          closingScreenId,
+          true
+        );
+
+        if (
+          popCount === 1 &&
+          typeof navigationController.popViewControllerAnimated === 'function'
+        ) {
+          navigationController.popViewControllerAnimated(true);
+        } else if (
+          popCount >= nativeCount - 1 &&
+          typeof navigationController.popToRootViewControllerAnimated ===
+            'function'
+        ) {
+          navigationController.popToRootViewControllerAnimated(true);
+        } else if (
+          targetController &&
+          typeof navigationController.popToViewControllerAnimated === 'function'
+        ) {
+          navigationController.popToViewControllerAnimated(
+            targetController,
+            true
+          );
+        } else if (
+          targetControllers.length > 0 &&
+          typeof navigationController.setViewControllersAnimated === 'function'
+        ) {
+          navigationController.setViewControllersAnimated(
+            createArray(targetControllers),
+            true
+          );
+        } else if (
+          typeof navigationController.popViewControllerAnimated === 'function'
+        ) {
+          navigationController.popViewControllerAnimated(true);
+        } else {
+          finishTransition(stackId, registry, ctx, true, closingScreenId);
+          return 'unsupported';
+        }
+
+        updateNativeBackGesture(navigationController);
+        scheduleTransitionFallback(
+          stackId,
+          registry,
+          ctx,
+          token,
+          true,
+          closingScreenId,
+          targetScreenIds,
+          navigationController,
+          true
+        );
+        return 'ok';
+      },
+      screenId,
+      count
+    )
+    .catch(() => 'error');
+}
+
+export function repairNativeScriptStackAfterDismiss(screenId: string) {
+  return (NativeScriptRuntime as any)
+    .runOnUI((dismissedScreenId: string) => {
+      'worklet';
+      const registry = (globalThis as Record<string, any>)[REGISTRY_KEY] as
+        | NativeScriptStackRegistry
+        | undefined;
+
+      if (!registry) {
+        return 'no-registry';
+      }
+
+      const stackId = registry.screenParents[dismissedScreenId];
+      const navigationController = stackId ? registry.stacks[stackId] : null;
+      const ctx = stackId ? registry.stackContexts[stackId] : null;
+
+      if (!stackId || !navigationController) {
+        return 'missing-stack';
+      }
+
+      const activeIds = registry.stackActiveScreenIds[stackId] ?? [];
+      const target = controllersForIds(activeIds, registry);
+
+      if (
+        target.availableIds.length === 0 ||
+        target.availableIds.length !== activeIds.length
+      ) {
+        return 'missing-controllers';
+      }
+
+      setNavigationControllerViewControllers(
+        navigationController,
+        target.controllers,
+        false
+      );
+      registry.stackNativeKeys[stackId] = idsKey(target.availableIds);
+      registry.stackNativeCounts[stackId] = target.availableIds.length;
+      layoutNavigationStackViews(navigationController);
+      configureStackControllers(target.availableIds, registry);
+      configureNavigationAppearance(
+        navigationController,
+        registry.screenHeaderConfigs[
+          target.availableIds[target.availableIds.length - 1]
+        ]
+      );
+      updateNativeBackGesture(navigationController);
+      cleanupDetachedScreens(stackId, registry);
+
+      if (ctx) {
+        scheduleStackChange(ctx);
+      }
+
+      return 'ok';
+    }, screenId)
+    .catch(() => 'error');
 }
 
 function navigationControllerScreenIds(
@@ -723,6 +1146,22 @@ function idsEqual(left: string[], right: string[]) {
   return true;
 }
 
+function shouldEmitNativeStackChange(shownIds: string[], activeIds: string[]) {
+  'worklet';
+
+  if (shownIds.length === 0 || shownIds.length >= activeIds.length) {
+    return false;
+  }
+
+  for (let index = 0; index < shownIds.length; index += 1) {
+    if (shownIds[index] !== activeIds[index]) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 function idsFromKey(key: string | undefined) {
   'worklet';
 
@@ -756,6 +1195,66 @@ function controllersForIds(ids: string[], registry: NativeScriptStackRegistry) {
   return { availableIds, controllers };
 }
 
+function controllersThroughIndex(viewControllers: any, targetIndex: number) {
+  'worklet';
+  const controllers: any[] = [];
+  const count = arrayCount(viewControllers);
+  const lastIndex = Math.min(Math.max(0, targetIndex), count - 1);
+
+  for (let index = 0; index <= lastIndex; index += 1) {
+    const controller = arrayItem(viewControllers, index);
+
+    if (controller) {
+      controllers.push(controller);
+    }
+  }
+
+  return controllers;
+}
+
+function rectWithY(rect: any, y: number) {
+  'worklet';
+  const origin = rect?.origin;
+  const size = rect?.size;
+  const CGRectMake = nativeValue('CGRectMake');
+  const x = origin?.x ?? 0;
+  const width = size?.width ?? 0;
+  const height = size?.height ?? 0;
+
+  if (typeof CGRectMake === 'function') {
+    return CGRectMake(x, y, width, height);
+  }
+
+  return {
+    origin: { x, y },
+    size: { height, width },
+  };
+}
+
+function animateWithDuration(
+  duration: number,
+  animations: () => void,
+  completion: () => void
+) {
+  'worklet';
+  const UIView = nativeValue('UIView');
+
+  if (
+    UIView &&
+    typeof UIView.animateWithDurationAnimationsCompletion === 'function'
+  ) {
+    UIView.animateWithDurationAnimationsCompletion(
+      duration,
+      animations,
+      completion
+    );
+    return;
+  }
+
+  animations();
+  completion();
+}
+
 function updateNativeBackGesture(navigationController: any) {
   'worklet';
   const gesture = navigationController?.interactivePopGestureRecognizer;
@@ -780,7 +1279,7 @@ function installNativeBackGestureDelegate(navigationController: any, ctx: any) {
   const delegateProtocol =
     nativeValue('UIGestureRecognizerDelegate') ?? 'UIGestureRecognizerDelegate';
 
-  ctx.delegate(gesture, delegateProtocol, {
+  const delegate = ctx.delegate(gesture, delegateProtocol, {
     gestureRecognizerShouldBegin() {
       'worklet';
 
@@ -792,6 +1291,7 @@ function installNativeBackGestureDelegate(navigationController: any, ctx: any) {
       return true;
     },
   });
+  gesture.delegate = delegate;
 
   updateNativeBackGesture(navigationController);
 }
@@ -817,42 +1317,15 @@ function configureNavigationAppearance(
     const previousController = arrayItem(viewControllers, count - 2);
     const navigationItem = previousController?.navigationItem;
 
+    configureSourceBackButton(navigationItem, headerConfig);
+  } else if (count === 1) {
+    const rootController = arrayItem(viewControllers, 0);
+    const navigationItem = rootController?.navigationItem;
+
     if (navigationItem) {
-      navigationItem.backButtonDisplayMode = backButtonDisplayMode(
-        headerConfig?.backTitleVisible === false
-          ? 'minimal'
-          : headerConfig?.backButtonDisplayMode
-      );
-
-      if (
-        headerConfig?.backTitle != null ||
-        headerConfig?.backTitleVisible === false
-      ) {
-        const UIBarButtonItem = nativeValue('UIBarButtonItem');
-        const style =
-          nativeValue('UIBarButtonItemStyle')?.Plain ??
-          nativeValue('UIBarButtonItemStyle')?.plain ??
-          0;
-
-        if (UIBarButtonItem && typeof UIBarButtonItem.alloc === 'function') {
-          const itemAllocated = UIBarButtonItem.alloc();
-          const title =
-            headerConfig.backTitleVisible === false
-              ? ''
-              : headerConfig.backTitle;
-
-          navigationItem.backBarButtonItem =
-            itemAllocated &&
-            typeof itemAllocated.initWithTitleStyleTargetAction === 'function'
-              ? itemAllocated.initWithTitleStyleTargetAction(
-                  title,
-                  style,
-                  null,
-                  null
-                )
-              : itemAllocated;
-        }
-      }
+      navigationItem.backBarButtonItem = null;
+      navigationItem.backButtonTitle = '';
+      navigationItem.hidesBackButton = true;
     }
   }
 
@@ -932,10 +1405,12 @@ function configureScreenController(
   controller: any,
   props: Readonly<NativeScriptScreenStackItemProps>,
   ctx?: any,
-  isTopScreen = false
+  isTopScreen = false,
+  canGoBack = false
 ) {
   'worklet';
 
+  setScreenControllerIdentity(controller, props.screenId);
   configureExtendedLayout(controller);
 
   const headerConfig = props.headerConfig;
@@ -954,6 +1429,7 @@ function configureScreenController(
 
   if (navigationItem) {
     navigationItem.title = headerConfig?.title ?? '';
+    configureSourceBackButton(navigationItem, headerConfig);
     navigationItem.hidesBackButton = headerConfig?.hideBackButton === true;
     navigationItem.backButtonDisplayMode = backButtonDisplayMode(
       headerConfig?.backTitleVisible === false
@@ -972,7 +1448,7 @@ function configureScreenController(
     layoutNavigationStackViews(navigationController);
   }
 
-  configureHeaderBackButton(controller, props, ctx, isTopScreen);
+  configureHeaderBackButton(controller, props, isTopScreen, canGoBack);
   emitHeaderHeightChange(controller, props, ctx);
 }
 
@@ -982,7 +1458,8 @@ function configureStackControllers(
 ) {
   'worklet';
 
-  for (const id of ids) {
+  for (let index = 0; index < ids.length; index += 1) {
+    const id = ids[index];
     const controller = registry.screens[id];
     const props = registry.screenProps[id];
 
@@ -994,9 +1471,24 @@ function configureStackControllers(
       controller,
       props,
       registry.screenContexts[id],
-      id === ids[ids.length - 1]
+      index === ids.length - 1,
+      index > 0
     );
   }
+}
+
+function emitStackChangeForIds(ctx: any, screenIds: string[]) {
+  'worklet';
+
+  if (!ctx?.props?.stackId) {
+    return;
+  }
+
+  ctx.emit('onNativeStackChange', {
+    nativeEvent: {
+      screenIds,
+    },
+  });
 }
 
 function emitStackChange(ctx: any) {
@@ -1009,11 +1501,7 @@ function emitStackChange(ctx: any) {
   const registry = getRegistry(globalThis as Record<string, any>);
   const screenIds = stackVisibleScreenIds(ctx.props.stackId, registry);
 
-  ctx.emit('onNativeStackChange', {
-    nativeEvent: {
-      screenIds,
-    },
-  });
+  emitStackChangeForIds(ctx, screenIds);
 }
 
 function scheduleStackChange(ctx: any) {
@@ -1056,12 +1544,31 @@ function emitTransition(
   });
 }
 
+function emitScreenDismissed(
+  registry: NativeScriptStackRegistry,
+  screenId: string | undefined,
+  dismissCount: number
+) {
+  'worklet';
+
+  if (!screenId) {
+    return;
+  }
+
+  registry.screenContexts[screenId]?.emit?.('onDismissed', {
+    nativeEvent: {
+      dismissCount,
+    },
+  });
+}
+
 function markTransition(
   stackId: string,
   registry: NativeScriptStackRegistry,
   ctx: any,
   closing: boolean,
-  screenId: string | undefined
+  screenId: string | undefined,
+  nativeDriven = false
 ) {
   'worklet';
   const token = (registry.stackTransitionTokens[stackId] ?? 0) + 1;
@@ -1069,8 +1576,11 @@ function markTransition(
   registry.stackTransitionTokens[stackId] = token;
   registry.stackTransitioning[stackId] = true;
   registry.stackTransitionClosing[stackId] = closing;
+  registry.stackTransitionNativeDriven[stackId] = nativeDriven;
   registry.stackTransitionScreenIds[stackId] = screenId;
   emitTransition(ctx, 'start', closing, screenId);
+
+  return token;
 }
 
 function animateStackPush(parent: any, controller: any) {
@@ -1087,6 +1597,7 @@ function animateStackPush(parent: any, controller: any) {
 
 function animateStackPop(
   parent: any,
+  controllers: any[],
   targetController: any,
   nextCount: number,
   previousCount: number
@@ -1095,6 +1606,15 @@ function animateStackPop(
 
   if (!parent) {
     return false;
+  }
+
+  if (
+    nextCount === previousCount - 1 &&
+    typeof parent.popViewControllerAnimated === 'function'
+  ) {
+    parent.popViewControllerAnimated(true);
+
+    return true;
   }
 
   if (
@@ -1108,21 +1628,41 @@ function animateStackPop(
   }
 
   if (
-    nextCount === previousCount - 1 &&
-    typeof parent.popViewControllerAnimated === 'function'
-  ) {
-    parent.popViewControllerAnimated(true);
-
-    return true;
-  }
-
-  if (
     targetController &&
     typeof parent.popToViewControllerAnimated === 'function'
   ) {
     parent.popToViewControllerAnimated(targetController, true);
 
     return true;
+  }
+
+  if (
+    controllers.length > 0 &&
+    typeof parent.setViewControllersAnimated === 'function'
+  ) {
+    parent.setViewControllersAnimated(createArray(controllers), true);
+
+    return true;
+  }
+
+  if (typeof parent.popViewControllerAnimated === 'function') {
+    const nativeControllers = parent.viewControllers;
+    const topController =
+      parent.topViewController ??
+      arrayItem(nativeControllers, arrayCount(nativeControllers) - 1);
+
+    if (
+      topController &&
+      typeof parent.setViewControllersAnimated === 'function'
+    ) {
+      parent.setViewControllersAnimated(
+        createArray([...controllers, topController]),
+        false
+      );
+      parent.popViewControllerAnimated(true);
+
+      return true;
+    }
   }
 
   return false;
@@ -1134,17 +1674,89 @@ function setNavigationControllerViewControllers(
   animated: boolean
 ) {
   'worklet';
+  const nativeControllers = createArray(controllers);
+
+  if (navigationController && !animated) {
+    const currentCount = arrayCount(navigationController.viewControllers);
+
+    if (
+      controllers.length > 1 &&
+      typeof navigationController.pushViewControllerAnimated === 'function'
+    ) {
+      const rootControllers = createArray([controllers[0]]);
+
+      if (
+        typeof navigationController.setViewControllersAnimated === 'function'
+      ) {
+        navigationController.setViewControllersAnimated(rootControllers, false);
+      }
+
+      navigationController.viewControllers = rootControllers;
+
+      for (let index = 1; index < controllers.length; index += 1) {
+        const controller = controllers[index];
+
+        if (controller) {
+          navigationController.pushViewControllerAnimated(controller, false);
+        }
+      }
+
+      return;
+    }
+
+    if (
+      controllers.length > currentCount &&
+      typeof navigationController.pushViewControllerAnimated === 'function'
+    ) {
+      for (let index = currentCount; index < controllers.length; index += 1) {
+        const controller = controllers[index];
+
+        if (controller) {
+          navigationController.pushViewControllerAnimated(controller, false);
+        }
+      }
+
+      return;
+    }
+
+    if (controllers.length > 0 && controllers.length < currentCount) {
+      const targetController = controllers[controllers.length - 1];
+
+      if (
+        controllers.length === 1 &&
+        typeof navigationController.popToRootViewControllerAnimated ===
+          'function'
+      ) {
+        navigationController.popToRootViewControllerAnimated(false);
+      } else if (
+        targetController &&
+        typeof navigationController.popToViewControllerAnimated === 'function'
+      ) {
+        navigationController.popToViewControllerAnimated(
+          targetController,
+          false
+        );
+      }
+    }
+  }
 
   if (
     navigationController &&
     typeof navigationController.setViewControllersAnimated === 'function'
   ) {
     navigationController.setViewControllersAnimated(
-      createArray(controllers),
+      nativeControllers,
       animated
     );
-  } else if (navigationController) {
-    navigationController.viewControllers = createArray(controllers);
+  }
+
+  if (navigationController && !animated) {
+    navigationController.viewControllers = nativeControllers;
+  } else if (
+    navigationController &&
+    typeof navigationController.setViewControllersAnimated !== 'function'
+  ) {
+    navigationController.viewControllers = nativeControllers;
   }
 }
 
@@ -1153,17 +1765,89 @@ function finishTransition(
   registry: NativeScriptStackRegistry,
   ctx: any,
   closing: boolean,
-  screenId: string | undefined
+  screenId: string | undefined,
+  emitStackChange = false
 ) {
   'worklet';
 
   emitTransition(ctx, 'end', closing, screenId);
   registry.stackTransitioning[stackId] = false;
   registry.stackTransitionClosing[stackId] = undefined;
+  registry.stackTransitionNativeDriven[stackId] = undefined;
   registry.stackTransitionScreenIds[stackId] = undefined;
   registry.stackTransitionTokens[stackId] =
     (registry.stackTransitionTokens[stackId] ?? 0) + 1;
-  scheduleStackChange(ctx);
+
+  if (emitStackChange) {
+    scheduleStackChange(ctx);
+  }
+
+  cleanupDetachedScreens(stackId, registry);
+}
+
+function scheduleTransitionFallback(
+  stackId: string,
+  registry: NativeScriptStackRegistry,
+  ctx: any,
+  token: number,
+  closing: boolean,
+  screenId: string | undefined,
+  targetIds: string[],
+  navigationController: any,
+  emitStackChange: boolean
+) {
+  'worklet';
+
+  if (typeof setTimeout !== 'function') {
+    return;
+  }
+
+  const complete = () => {
+    'worklet';
+    const currentToken = registry.stackTransitionTokens[stackId];
+
+    if (currentToken !== token && currentToken !== token + 1) {
+      return;
+    }
+
+    const target = controllersForIds(targetIds, registry);
+
+    if (
+      navigationController &&
+      target.availableIds.length > 0 &&
+      target.availableIds.length === targetIds.length
+    ) {
+      setNavigationControllerViewControllers(
+        navigationController,
+        target.controllers,
+        false
+      );
+      registry.stackNativeKeys[stackId] = idsKey(target.availableIds);
+      registry.stackNativeCounts[stackId] = target.availableIds.length;
+      layoutNavigationStackViews(navigationController);
+      configureStackControllers(target.availableIds, registry);
+      configureNavigationAppearance(
+        navigationController,
+        registry.screenHeaderConfigs[
+          target.availableIds[target.availableIds.length - 1]
+        ]
+      );
+      updateNativeBackGesture(navigationController);
+    }
+
+    if (registry.stackTransitioning[stackId] === true) {
+      finishTransition(
+        stackId,
+        registry,
+        ctx,
+        closing,
+        screenId,
+        emitStackChange
+      );
+    }
+  };
+
+  setTimeout(complete, 420);
 }
 
 function configureModalNavigationController(
@@ -1180,40 +1864,6 @@ function configureModalNavigationController(
   navigationController.modalPresentationStyle =
     modalPresentationStyle(presentation);
   navigationController.modalTransitionStyle = modalTransitionStyle();
-}
-
-function rootPresentedTouchView(navigationController: any) {
-  'worklet';
-  const firstController = arrayItem(navigationController?.viewControllers, 0);
-
-  return firstController?.view ?? navigationController?.view;
-}
-
-function attachPresentedReactTouchHandler(
-  stackId: string,
-  registry: NativeScriptStackRegistry,
-  ctx: any,
-  view: any
-) {
-  'worklet';
-
-  void stackId;
-  void registry;
-  void ctx;
-  void view;
-}
-
-function detachPresentedReactTouchHandler(
-  stackId: string,
-  registry: NativeScriptStackRegistry,
-  ctx: any,
-  view: any
-) {
-  'worklet';
-  void stackId;
-  void registry;
-  void ctx;
-  void view;
 }
 
 function createNavigationController(controllers: any[]) {
@@ -1259,9 +1909,8 @@ function presentModalStack(
 
   if (
     !modalNavigationController ||
-    !parentNavigationController ||
-    typeof parentNavigationController.presentViewControllerAnimatedCompletion !==
-      'function'
+    !parentNavigationController?.view ||
+    typeof parentNavigationController.addChildViewController !== 'function'
   ) {
     return false;
   }
@@ -1271,14 +1920,16 @@ function presentModalStack(
     rootProps?.stackPresentation
   );
   installNativeBackGestureDelegate(modalNavigationController, ctx);
-  attachPresentedReactTouchHandler(
-    stackId,
-    registry,
-    ctx,
-    rootPresentedTouchView(modalNavigationController)
-  );
   registry.stackModalNavigationControllers[stackId] = modalNavigationController;
   registry.stackModalKeys[stackId] = idsKey(modalIds);
+
+  const hostController =
+    parentNavigationController.tabBarController ?? parentNavigationController;
+  const hostView = hostController.view;
+  const finalFrame = hostView.bounds;
+  const height = finalFrame?.size?.height ?? 0;
+  modalNavigationController.view.tag = MODAL_VIEW_TAG;
+  modalNavigationController.view.autoresizingMask = flexibleSizeMask();
 
   configureStackControllers(modalIds, registry);
   configureNavigationAppearance(
@@ -1286,11 +1937,6 @@ function presentModalStack(
     registry.screenHeaderConfigs[modalIds[modalIds.length - 1]]
   );
   markTransition(stackId, registry, ctx, false, rootScreenId);
-  parentNavigationController.presentViewControllerAnimatedCompletion(
-    modalNavigationController,
-    animated,
-    null
-  );
 
   const complete = () => {
     'worklet';
@@ -1303,11 +1949,45 @@ function presentModalStack(
     finishTransition(stackId, registry, ctx, false, rootScreenId);
   };
 
-  if (typeof setTimeout === 'function') {
-    setTimeout(complete, animated ? 360 : 0);
-  } else {
-    complete();
+  if (
+    typeof hostController.presentViewControllerAnimatedCompletion === 'function'
+  ) {
+    registry.stackModalPresentedModally[stackId] = true;
+    hostController.presentViewControllerAnimatedCompletion(
+      modalNavigationController,
+      animated,
+      complete
+    );
+
+    return true;
   }
+
+  registry.stackModalPresentedModally[stackId] = false;
+  modalNavigationController.view.tag = MODAL_VIEW_TAG;
+  modalNavigationController.view.frame = animated
+    ? rectWithY(finalFrame, height)
+    : finalFrame;
+  modalNavigationController.view.autoresizingMask = flexibleSizeMask();
+  hostController.addChildViewController(modalNavigationController);
+  hostView.addSubview(modalNavigationController.view);
+  if (typeof hostView.bringSubviewToFront === 'function') {
+    hostView.bringSubviewToFront(modalNavigationController.view);
+  }
+  if (
+    typeof modalNavigationController.didMoveToParentViewController ===
+    'function'
+  ) {
+    modalNavigationController.didMoveToParentViewController(hostController);
+  }
+
+  animateWithDuration(
+    animated ? 0.32 : 0,
+    () => {
+      'worklet';
+      modalNavigationController.view.frame = finalFrame;
+    },
+    complete
+  );
 
   return true;
 }
@@ -1327,52 +2007,182 @@ function dismissModalStack(
     return false;
   }
 
-  markTransition(stackId, registry, ctx, true, closingScreenId);
+  const dismissCount = Math.max(
+    1,
+    arrayCount(modalNavigationController.viewControllers)
+  );
+  const wasPresentedModally =
+    registry.stackModalPresentedModally[stackId] === true;
+  let didCompleteDismissal = false;
+  const complete = () => {
+    'worklet';
+    if (didCompleteDismissal) {
+      return;
+    }
+
+    didCompleteDismissal = true;
+
+    const parentView = modalNavigationController.view?.superview;
+
+    if (wasPresentedModally && modalNavigationController.view) {
+      modalNavigationController.view.userInteractionEnabled = false;
+      modalNavigationController.view.hidden = true;
+
+      if (
+        typeof modalNavigationController.view.removeFromSuperview === 'function'
+      ) {
+        modalNavigationController.view.removeFromSuperview();
+      }
+    }
+
+    if (!wasPresentedModally) {
+      if (
+        typeof modalNavigationController.willMoveToParentViewController ===
+        'function'
+      ) {
+        modalNavigationController.willMoveToParentViewController(null);
+      }
+
+      if (modalNavigationController.view) {
+        modalNavigationController.view.userInteractionEnabled = false;
+        modalNavigationController.view.hidden = true;
+
+        if (finalFrame) {
+          modalNavigationController.view.frame = rectWithY(finalFrame, height);
+        }
+
+        if (
+          typeof modalNavigationController.view.removeFromSuperview ===
+          'function'
+        ) {
+          modalNavigationController.view.removeFromSuperview();
+        }
+      }
+
+      if (
+        typeof modalNavigationController.removeFromParentViewController ===
+        'function'
+      ) {
+        modalNavigationController.removeFromParentViewController();
+      }
+    }
+
+    const cleanupTaggedModalViews = () => {
+      'worklet';
+      removeTaggedSubviews(parentView, MODAL_VIEW_TAG);
+      removeTaggedSubviews(
+        registry.stacks[stackId]?.view?.window,
+        MODAL_VIEW_TAG
+      );
+    };
+
+    cleanupTaggedModalViews();
+    if (typeof setTimeout === 'function') {
+      setTimeout(cleanupTaggedModalViews, 0);
+      setTimeout(cleanupTaggedModalViews, 64);
+      setTimeout(cleanupTaggedModalViews, 250);
+    }
+    registry.stackModalNavigationControllers[stackId] = undefined;
+    registry.stackModalKeys[stackId] = undefined;
+    registry.stackModalPresentedModally[stackId] = undefined;
+    const shouldEmitDismissed =
+      registry.stackModalDismissRequestedFromJS[stackId] !== true;
+    registry.stackModalDismissRequestedFromJS[stackId] = undefined;
+
+    const baseScreenIds = (registry.stackActiveScreenIds[stackId] ?? []).filter(
+      (screenId) =>
+        !isModalPresentation(registry.screenProps[screenId]?.stackPresentation)
+    );
+    const base = controllersForIds(baseScreenIds, registry);
+    const baseNavigationController = registry.stacks[stackId];
+
+    if (baseNavigationController && base.availableIds.length > 0) {
+      const hostController =
+        baseNavigationController.tabBarController ?? baseNavigationController;
+
+      if (hostController?.view) {
+        hostController.view.hidden = false;
+        hostController.view.alpha = 1;
+        hostController.view.userInteractionEnabled = true;
+      }
+
+      if (baseNavigationController.view) {
+        baseNavigationController.view.hidden = false;
+        baseNavigationController.view.alpha = 1;
+        baseNavigationController.view.userInteractionEnabled = true;
+      }
+
+      setNavigationControllerViewControllers(
+        baseNavigationController,
+        base.controllers,
+        false
+      );
+      registry.stackNativeKeys[stackId] = idsKey(base.availableIds);
+      registry.stackNativeCounts[stackId] = base.availableIds.length;
+      layoutNavigationStackViews(baseNavigationController);
+      if (
+        baseNavigationController.view &&
+        typeof baseNavigationController.view.setNeedsLayout === 'function'
+      ) {
+        baseNavigationController.view.setNeedsLayout();
+      }
+      if (
+        baseNavigationController.view &&
+        typeof baseNavigationController.view.layoutIfNeeded === 'function'
+      ) {
+        baseNavigationController.view.layoutIfNeeded();
+      }
+      configureStackControllers(base.availableIds, registry);
+      configureNavigationAppearance(
+        baseNavigationController,
+        registry.screenHeaderConfigs[
+          base.availableIds[base.availableIds.length - 1]
+        ]
+      );
+      updateNativeBackGesture(baseNavigationController);
+    }
+
+    emitTransition(ctx, 'start', true, closingScreenId);
+    emitTransition(ctx, 'end', true, closingScreenId);
+    if (shouldEmitDismissed) {
+      emitScreenDismissed(registry, closingScreenId, dismissCount);
+    }
+    cleanupDetachedScreens(stackId, registry);
+  };
+
+  const parentView = modalNavigationController.view?.superview;
+  const finalFrame =
+    parentView?.bounds ?? modalNavigationController.view?.frame;
+  const height = finalFrame?.size?.height ?? 0;
 
   if (
+    wasPresentedModally &&
     typeof modalNavigationController.dismissViewControllerAnimatedCompletion ===
-    'function'
+      'function'
   ) {
     modalNavigationController.dismissViewControllerAnimatedCompletion(
       animated,
-      null
+      complete
     );
-  } else {
-    const presentingViewController =
-      modalNavigationController.presentingViewController;
 
-    if (
-      !presentingViewController ||
-      typeof presentingViewController.dismissViewControllerAnimatedCompletion !==
-        'function'
-    ) {
-      return false;
+    if (typeof setTimeout === 'function') {
+      setTimeout(complete, animated ? 420 : 0);
+      setTimeout(complete, 700);
     }
 
-    presentingViewController.dismissViewControllerAnimatedCompletion(
-      animated,
-      null
-    );
+    return true;
   }
 
-  const complete = () => {
-    'worklet';
-    detachPresentedReactTouchHandler(
-      stackId,
-      registry,
-      ctx,
-      rootPresentedTouchView(modalNavigationController)
-    );
-    registry.stackModalNavigationControllers[stackId] = undefined;
-    registry.stackModalKeys[stackId] = undefined;
-    finishTransition(stackId, registry, ctx, true, closingScreenId);
-  };
-
-  if (typeof setTimeout === 'function') {
-    setTimeout(complete, animated ? 360 : 0);
-  } else {
-    complete();
-  }
+  animateWithDuration(
+    animated ? 0.28 : 0,
+    () => {
+      'worklet';
+      if (modalNavigationController.view && finalFrame) {
+        modalNavigationController.view.frame = rectWithY(finalFrame, height);
+      }
+    },
+    complete
+  );
 
   return true;
 }
@@ -1428,6 +2238,19 @@ function reconcilePresentedModalStack(
   registry.stackNativeCounts[stackId] = availableIds.length;
 
   if (!modalNavigationController) {
+    if (arrayCount(modal.controllers[0]?.view?.subviews) === 0) {
+      const retries = registry.stackPendingContentRetries[stackId] ?? 0;
+
+      if (retries < 12) {
+        registry.stackPendingContentRetries[stackId] = retries + 1;
+        return true;
+      }
+
+      registry.stackPendingContentRetries[stackId] = undefined;
+    } else {
+      registry.stackPendingContentRetries[stackId] = undefined;
+    }
+
     return presentModalStack(
       stackId,
       registry,
@@ -1464,6 +2287,36 @@ function reconcilePresentedModalStack(
   return true;
 }
 
+function controllerHasReactContent(controller: any) {
+  'worklet';
+
+  return arrayCount(controller?.view?.subviews) > 0;
+}
+
+function shouldDelayPushUntilControllerHasContent(
+  stackId: string,
+  registry: NativeScriptStackRegistry,
+  controller: any
+) {
+  'worklet';
+
+  if (controllerHasReactContent(controller)) {
+    registry.stackPendingContentRetries[stackId] = undefined;
+    return false;
+  }
+
+  const retries = registry.stackPendingContentRetries[stackId] ?? 0;
+
+  if (retries >= 4) {
+    registry.stackPendingContentRetries[stackId] = undefined;
+    return false;
+  }
+
+  registry.stackPendingContentRetries[stackId] = retries + 1;
+
+  return true;
+}
+
 function reconcileStack(
   stackId: string,
   registry: NativeScriptStackRegistry,
@@ -1480,6 +2333,11 @@ function reconcileStack(
   const nextCount = controllers.length;
 
   if (!navigationController || nextCount === 0) {
+    return;
+  }
+
+  if (registry.stackTransitioning[stackId]) {
+    updateNativeBackGesture(navigationController);
     return;
   }
 
@@ -1565,52 +2423,100 @@ function reconcileStack(
       nativeIds.length <= previousCount
     ) {
       const pushedScreenId = availableIds[nextCount - 1];
+      const pushedController = controllers[nextCount - 1];
 
-      markTransition(stackId, registry, ctx, false, pushedScreenId);
+      if (
+        shouldDelayPushUntilControllerHasContent(
+          stackId,
+          registry,
+          pushedController
+        )
+      ) {
+        return;
+      }
+
+      const token = markTransition(
+        stackId,
+        registry,
+        ctx,
+        false,
+        pushedScreenId
+      );
       configureScreenController(
-        controllers[nextCount - 1],
+        pushedController,
         registry.screenProps[pushedScreenId]!,
         registry.screenContexts[pushedScreenId],
-        true
+        true,
+        nextCount > 1
       );
+      if (nextCount > 1) {
+        configureSourceBackButton(
+          controllers[nextCount - 2]?.navigationItem,
+          registry.screenHeaderConfigs[pushedScreenId]
+        );
+      }
 
-      if (animateStackPush(navigationController, controllers[nextCount - 1])) {
+      if (animateStackPush(navigationController, pushedController)) {
         updateNativeBackGesture(navigationController);
+        scheduleTransitionFallback(
+          stackId,
+          registry,
+          ctx,
+          token,
+          false,
+          pushedScreenId,
+          availableIds,
+          navigationController,
+          false
+        );
 
         return;
       }
 
       registry.stackTransitioning[stackId] = false;
       registry.stackTransitionClosing[stackId] = undefined;
+      registry.stackTransitionNativeDriven[stackId] = undefined;
       registry.stackTransitionScreenIds[stackId] = undefined;
     }
 
     if (isPop && nativeIds.length > nextCount) {
       const poppedScreenId = previousIds[nextCount];
 
-      markTransition(stackId, registry, ctx, true, poppedScreenId);
-      configureScreenController(
-        controllers[nextCount - 1],
-        registry.screenProps[availableIds[nextCount - 1]]!,
-        registry.screenContexts[availableIds[nextCount - 1]],
-        true
+      const token = markTransition(
+        stackId,
+        registry,
+        ctx,
+        true,
+        poppedScreenId
       );
-
       if (
         animateStackPop(
           navigationController,
+          controllers,
           controllers[nextCount - 1],
           nextCount,
           previousCount
         )
       ) {
         updateNativeBackGesture(navigationController);
+        scheduleTransitionFallback(
+          stackId,
+          registry,
+          ctx,
+          token,
+          true,
+          poppedScreenId,
+          availableIds,
+          navigationController,
+          true
+        );
 
         return;
       }
 
       registry.stackTransitioning[stackId] = false;
       registry.stackTransitionClosing[stackId] = undefined;
+      registry.stackTransitionNativeDriven[stackId] = undefined;
       registry.stackTransitionScreenIds[stackId] = undefined;
     }
   }
@@ -1628,11 +2534,13 @@ function reconcileStack(
     registry.screenHeaderConfigs[availableIds[nextCount - 1]]
   );
   updateNativeBackGesture(navigationController);
+  cleanupDetachedScreens(stackId, registry);
 }
 
 const NativeScriptStackController = NativeScriptRuntime.defineUIViewController<
   {
     activeScreenIds: string[];
+    contentRevision: number;
     onNativeStackChange?: (event: NativeStackChangeEvent) => void;
     onNativeStackTransition?: (event: NativeStackTransitionEvent) => void;
     stackId: string;
@@ -1730,20 +2638,18 @@ const NativeScriptStackController = NativeScriptRuntime.defineUIViewController<
           return;
         }
 
-        layoutNavigationStackViews(navigationController);
-        configureStackControllers(
-          navigationControllerScreenIds(navigationController, registry),
-          registry
-        );
-
         if (registry.stackTransitioning[ctx.props.stackId]) {
           return;
         }
 
-        registry.stackTransitioning[ctx.props.stackId] = true;
-        registry.stackTransitionClosing[ctx.props.stackId] = closing;
-        registry.stackTransitionScreenIds[ctx.props.stackId] = affectedScreenId;
-        emitTransition(ctx, 'start', closing, affectedScreenId);
+        markTransition(
+          ctx.props.stackId,
+          registry,
+          ctx,
+          closing,
+          affectedScreenId,
+          true
+        );
       },
       navigationControllerDidShowViewControllerAnimated(
         navigationController: any,
@@ -1752,41 +2658,144 @@ const NativeScriptStackController = NativeScriptRuntime.defineUIViewController<
         'worklet';
         const registry = getRegistry(globalThis as Record<string, any>);
         const screenId = screenIdForController(viewController, registry);
+        const shownScreenIds = navigationControllerScreenIds(
+          navigationController,
+          registry
+        );
 
         if (!screenId) {
           layoutNavigationStackViews(navigationController);
           updateNativeBackGesture(navigationController);
+
+          const activeIds =
+            registry.stackActiveScreenIds[ctx.props.stackId] ?? [];
+          const previousIds = idsFromKey(
+            registry.stackNativeKeys[ctx.props.stackId]
+          );
+          const nativeCount = arrayCount(navigationController?.viewControllers);
+          const isClosing =
+            registry.stackTransitionClosing[ctx.props.stackId] === true;
+          const fallbackScreenIds = !isClosing
+            ? activeIds
+            : shownScreenIds.length > 0
+              ? shownScreenIds
+              : nativeCount > 0 && nativeCount < activeIds.length
+                ? activeIds.slice(0, nativeCount)
+                : previousIds.length > 1
+                  ? previousIds.slice(0, previousIds.length - 1)
+                  : activeIds;
+          const shouldEmitStackChange =
+            shouldEmitNativeStackChange(fallbackScreenIds, activeIds) &&
+            isClosing;
+
+          if (shouldEmitStackChange) {
+            const applyFallbackControllers = () => {
+              'worklet';
+              const fallback = controllersForIds(fallbackScreenIds, registry);
+
+              if (
+                fallback.availableIds.length === 0 ||
+                fallback.availableIds.length !== fallbackScreenIds.length
+              ) {
+                return;
+              }
+
+              setNavigationControllerViewControllers(
+                navigationController,
+                fallback.controllers,
+                false
+              );
+              layoutNavigationStackViews(navigationController);
+              configureStackControllers(fallback.availableIds, registry);
+              configureNavigationAppearance(
+                navigationController,
+                registry.screenHeaderConfigs[
+                  fallback.availableIds[fallback.availableIds.length - 1]
+                ]
+              );
+              updateNativeBackGesture(navigationController);
+            };
+
+            applyFallbackControllers();
+
+            if (typeof setTimeout === 'function') {
+              setTimeout(applyFallbackControllers, 0);
+              setTimeout(applyFallbackControllers, 64);
+              setTimeout(applyFallbackControllers, 250);
+            }
+          }
+
+          if (registry.stackTransitioning[ctx.props.stackId] === true) {
+            if (fallbackScreenIds.length > 0) {
+              registry.stackNativeKeys[ctx.props.stackId] =
+                idsKey(fallbackScreenIds);
+              registry.stackNativeCounts[ctx.props.stackId] =
+                fallbackScreenIds.length;
+            }
+
+            finishTransition(
+              ctx.props.stackId,
+              registry,
+              ctx,
+              isClosing,
+              registry.stackTransitionScreenIds[ctx.props.stackId],
+              registry.stackTransitionNativeDriven[ctx.props.stackId] ===
+                true || shouldEmitStackChange
+            );
+          } else if (fallbackScreenIds.length > 0) {
+            registry.stackNativeKeys[ctx.props.stackId] =
+              idsKey(fallbackScreenIds);
+            registry.stackNativeCounts[ctx.props.stackId] =
+              fallbackScreenIds.length;
+          }
+
+          if (shouldEmitStackChange) {
+            emitStackChangeForIds(ctx, fallbackScreenIds);
+          }
+
           return;
         }
 
         layoutNavigationStackViews(navigationController);
-        configureStackControllers(
-          navigationControllerScreenIds(navigationController, registry),
-          registry
-        );
+        configureStackControllers(shownScreenIds, registry);
         updateNativeBackGesture(navigationController);
         configureNavigationAppearance(
           navigationController,
           registry.screenHeaderConfigs[screenId]
         );
-        scheduleStackChange(ctx);
+        registry.stackNativeKeys[ctx.props.stackId] = idsKey(shownScreenIds);
+        registry.stackNativeCounts[ctx.props.stackId] = shownScreenIds.length;
+        const isTransitioning =
+          registry.stackTransitioning[ctx.props.stackId] === true;
         const wasClosing =
           registry.stackTransitionClosing[ctx.props.stackId] === true;
+        const transitionScreenId =
+          registry.stackTransitionScreenIds[ctx.props.stackId] ?? screenId;
+        const activeIds =
+          registry.stackActiveScreenIds[ctx.props.stackId] ?? [];
+        const shouldEmitStackChange =
+          registry.stackTransitionNativeDriven[ctx.props.stackId] === true ||
+          shouldEmitNativeStackChange(shownScreenIds, activeIds);
 
-        emitTransition(
-          ctx,
-          'end',
-          wasClosing,
-          registry.stackTransitionScreenIds[ctx.props.stackId] ?? screenId
-        );
-        registry.stackTransitioning[ctx.props.stackId] = false;
-        registry.stackTransitionClosing[ctx.props.stackId] = undefined;
-        registry.stackTransitionScreenIds[ctx.props.stackId] = undefined;
-        registry.stackTransitionTokens[ctx.props.stackId] =
-          (registry.stackTransitionTokens[ctx.props.stackId] ?? 0) + 1;
+        if (isTransitioning) {
+          finishTransition(
+            ctx.props.stackId,
+            registry,
+            ctx,
+            wasClosing,
+            transitionScreenId,
+            shouldEmitStackChange
+          );
+        } else if (shouldEmitStackChange) {
+          scheduleStackChange(ctx);
+        }
 
-        if (!wasClosing) {
+        if (isTransitioning && !wasClosing) {
           reconcileStack(ctx.props.stackId, registry, ctx, true);
+        } else if (isTransitioning && !shouldEmitStackChange) {
+          if (!idsEqual(shownScreenIds, activeIds)) {
+            reconcileStack(ctx.props.stackId, registry, ctx, true);
+          }
         }
       },
     });
@@ -1832,14 +2841,6 @@ const NativeScriptStackController = NativeScriptRuntime.defineUIViewController<
       return;
     }
 
-    const modalNavigationController =
-      registry.stackModalNavigationControllers[props.stackId];
-    detachPresentedReactTouchHandler(
-      props.stackId,
-      registry,
-      registry.stackContexts[props.stackId],
-      rootPresentedTouchView(modalNavigationController)
-    );
     registry.stacks[props.stackId] = undefined;
     registry.stackContexts[props.stackId] = undefined;
     registry.stackActiveScreenIds[props.stackId] = undefined;
@@ -1847,10 +2848,14 @@ const NativeScriptStackController = NativeScriptRuntime.defineUIViewController<
     registry.stackNativeCounts[props.stackId] = undefined;
     registry.stackTransitioning[props.stackId] = undefined;
     registry.stackTransitionClosing[props.stackId] = undefined;
+    registry.stackTransitionNativeDriven[props.stackId] = undefined;
     registry.stackTransitionScreenIds[props.stackId] = undefined;
     registry.stackTransitionTokens[props.stackId] = undefined;
+    registry.stackPendingContentRetries[props.stackId] = undefined;
     registry.stackModalNavigationControllers[props.stackId] = undefined;
     registry.stackModalKeys[props.stackId] = undefined;
+    registry.stackModalPresentedModally[props.stackId] = undefined;
+    registry.stackModalDismissRequestedFromJS[props.stackId] = undefined;
   },
 });
 
@@ -1888,6 +2893,8 @@ const NativeScriptScreenController = NativeScriptRuntime.defineUIViewController<
     const registry = getRegistry(globalThis as Record<string, any>);
 
     registry.screens[props.screenId] = controller;
+    registry.screenControllerHashes[props.screenId] =
+      controllerHash(controller);
     registry.screenHeaderConfigs[props.screenId] = props.headerConfig;
     registry.screenContexts[props.screenId] = ctx;
     registry.screenParents[props.screenId] = props.parentId;
@@ -1910,6 +2917,8 @@ const NativeScriptScreenController = NativeScriptRuntime.defineUIViewController<
     const registry = getRegistry(globalThis as Record<string, any>);
 
     registry.screens[props.screenId] = controller;
+    registry.screenControllerHashes[props.screenId] =
+      controllerHash(controller);
     registry.screenHeaderConfigs[props.screenId] = props.headerConfig;
     registry.screenContexts[props.screenId] = ctx;
     registry.screenParents[props.screenId] = props.parentId;
@@ -1925,7 +2934,7 @@ const NativeScriptScreenController = NativeScriptRuntime.defineUIViewController<
       );
     }
   },
-  dispose(_controller, props) {
+  dispose(controller, props) {
     'worklet';
     const registry = (globalThis as Record<string, any>)[REGISTRY_KEY];
 
@@ -1933,18 +2942,31 @@ const NativeScriptScreenController = NativeScriptRuntime.defineUIViewController<
       return;
     }
 
-    registry.screens[props.screenId] = undefined;
-    registry.screenHeaderConfigs[props.screenId] = undefined;
-    registry.screenContexts[props.screenId] = undefined;
-    registry.screenParents[props.screenId] = undefined;
-    registry.screenProps[props.screenId] = undefined;
+    const shouldRetainForNativePop =
+      props.parentId &&
+      screenControllerIsVisibleInNativeStack(
+        props.parentId,
+        controller,
+        registry
+      );
+
+    if (shouldRetainForNativePop) {
+      registry.screens[props.screenId] = controller;
+      registry.screenControllerHashes[props.screenId] =
+        controllerHash(controller);
+      registry.screenHeaderConfigs[props.screenId] = props.headerConfig;
+      registry.screenParents[props.screenId] = props.parentId;
+      registry.screenProps[props.screenId] = props;
+    } else {
+      clearScreenRecord(registry, props.screenId);
+    }
 
     if (props.parentId) {
       reconcileStack(
         props.parentId,
         registry,
         registry.stackContexts[props.parentId],
-        false
+        Boolean(shouldRetainForNativePop)
       );
     }
   },
@@ -1965,7 +2987,10 @@ export function NativeScriptScreenStack({
   );
   const nextItemOrderRef = React.useRef(0);
   const activeScreenIdsRef = React.useRef<string[]>([]);
-  const [, forceVersion] = React.useReducer((value: number) => value + 1, 0);
+  const [contentRevision, forceVersion] = React.useReducer(
+    (value: number) => value + 1,
+    0
+  );
 
   if (stackId.current === null) {
     nextStackId += 1;
@@ -1984,7 +3009,9 @@ export function NativeScriptScreenStack({
         !existing ||
         existing.active !== active ||
         existing.props.parentId !== props.parentId ||
-        existing.props.headerConfig !== props.headerConfig;
+        existing.props.headerConfig !== props.headerConfig ||
+        existing.props.nativeScriptContentRevision !==
+          props.nativeScriptContentRevision;
 
       registeredItemsRef.current.set(screenId, {
         active,
@@ -2032,6 +3059,10 @@ export function NativeScriptScreenStack({
       const nativeScreenIds = event.nativeEvent.screenIds;
       const activeIds = activeScreenIdsRef.current;
 
+      if (nativeScreenIds.length === 0) {
+        return;
+      }
+
       if (nativeScreenIds.length >= activeIds.length) {
         return;
       }
@@ -2060,6 +3091,7 @@ export function NativeScriptScreenStack({
       onNativeStackTransition?.(event);
 
       const { closing, phase, screenId } = event.nativeEvent;
+
       const itemProps = itemPropsByScreenIdRef.current.get(screenId);
 
       if (!itemProps) {
@@ -2094,6 +3126,7 @@ export function NativeScriptScreenStack({
       <NativeScriptStackController
         activeScreenIds={activeScreenIds}
         attachController
+        contentRevision={contentRevision}
         onNativeStackChange={handleNativeStackChange}
         onNativeStackTransition={handleNativeTransition}
         stackId={stackId.current}
@@ -2127,11 +3160,18 @@ export const NativeScriptScreenStackItem = React.forwardRef<
   const active = rest.activityState !== 0;
   const registeredPropsRef =
     React.useRef<NativeScriptScreenStackItemProps | null>(null);
+  const [contentRevision, bumpContentRevision] = React.useReducer(
+    (value: number) => value + 1,
+    0
+  );
+  const lastLayoutSignatureRef = React.useRef<string | null>(null);
+  const onLayoutProp = rest.onLayout;
 
   registeredPropsRef.current = {
     ...rest,
     contentStyle,
     headerConfig,
+    nativeScriptContentRevision: contentRevision,
     onHeaderHeightChange,
     parentId: resolvedParentId,
     screenId,
@@ -2139,14 +3179,33 @@ export const NativeScriptScreenStackItem = React.forwardRef<
     style,
   } as NativeScriptScreenStackItemProps;
 
+  const handleContentLayout = React.useCallback(
+    (event: LayoutChangeEvent) => {
+      onLayoutProp?.(event);
+
+      const { height, width, x, y } = event.nativeEvent.layout;
+      const layoutSignature = `${x}:${y}:${width}:${height}`;
+
+      if (lastLayoutSignatureRef.current === layoutSignature) {
+        return;
+      }
+
+      lastLayoutSignatureRef.current = layoutSignature;
+      bumpContentRevision();
+    },
+    [onLayoutProp]
+  );
+
   const content = (
     <View
       ref={ref}
       accessibilityElementsHidden={rest['aria-hidden'] === true}
       aria-hidden={rest['aria-hidden']}
+      pointerEvents={rest.pointerEvents}
       importantForAccessibility={
         rest['aria-hidden'] === true ? 'no-hide-descendants' : 'auto'
       }
+      onLayout={handleContentLayout}
       style={[styles.content, contentStyle]}
     >
       {children}
@@ -2158,12 +3217,48 @@ export const NativeScriptScreenStackItem = React.forwardRef<
       return;
     }
 
-    stackContext.registerScreen(screenId, registeredPropsRef.current!, active);
-
     return () => {
       stackContext.unregisterScreen(screenId);
     };
-  }, [active, headerConfig, resolvedParentId, screenId, stackContext]);
+  }, [screenId, stackContext]);
+
+  React.useLayoutEffect(() => {
+    if (!stackContext) {
+      return;
+    }
+
+    stackContext.registerScreen(screenId, registeredPropsRef.current!, active);
+  });
+
+  React.useEffect(() => {
+    if (!active) {
+      return;
+    }
+
+    let cancelled = false;
+    const timers: ReturnType<typeof setTimeout>[] = [];
+    const invalidateContent = () => {
+      if (!cancelled) {
+        bumpContentRevision();
+      }
+    };
+
+    invalidateContent();
+
+    timers.push(setTimeout(invalidateContent, 16));
+    timers.push(setTimeout(invalidateContent, 64));
+    timers.push(setTimeout(invalidateContent, 160));
+    timers.push(setTimeout(invalidateContent, 320));
+    timers.push(setTimeout(invalidateContent, 640));
+
+    return () => {
+      cancelled = true;
+
+      for (const timer of timers) {
+        clearTimeout(timer);
+      }
+    };
+  }, [active, screenId]);
 
   return (
     <NativeScriptScreenController
@@ -2173,6 +3268,7 @@ export const NativeScriptScreenStackItem = React.forwardRef<
       attachNativeView={false}
       contentStyle={contentStyle}
       headerConfig={headerConfig}
+      nativeScriptContentRevision={contentRevision}
       onHeaderHeightChange={onHeaderHeightChange}
       parentId={resolvedParentId}
       screenId={screenId}

@@ -42,6 +42,8 @@ import { useInvalidPreventRemoveError } from '../utils/useInvalidPreventRemoveEr
 import {
   NativeScriptScreenStack as ScreenStack,
   NativeScriptScreenStackItem as ScreenStackItem,
+  repairNativeScriptStackAfterDismiss,
+  requestNativeScriptStackPop,
 } from './NativeScriptScreenStack';
 import { useHeaderConfigProps } from './useHeaderConfigProps';
 
@@ -75,6 +77,42 @@ const TRANSPARENT_PRESENTATIONS = [
   'containedTransparentModal',
 ];
 
+const ORIGINAL_DISPATCH_KEY = '__nativeScriptOriginalDispatch';
+
+function nativePopCountForAction(action: any): number | null {
+  if (!action || typeof action.type !== 'string') {
+    return null;
+  }
+
+  if (action.type === 'GO_BACK') {
+    return 1;
+  }
+
+  if (action.type === 'POP') {
+    return Math.max(1, action.payload?.count ?? 1);
+  }
+
+  if (action.type === 'POP_TO_TOP') {
+    return Number.MAX_SAFE_INTEGER;
+  }
+
+  return null;
+}
+
+function dispatchWithOriginalNavigation(
+  navigation: NativeStackNavigationHelpers,
+  action: unknown
+) {
+  const navigationAny = navigation as any;
+  const originalDispatch = navigationAny[ORIGINAL_DISPATCH_KEY];
+
+  if (typeof originalDispatch === 'function') {
+    originalDispatch(action);
+  } else {
+    navigation.dispatch(action as never);
+  }
+}
+
 const SceneView = ({
   index,
   focused,
@@ -95,6 +133,99 @@ const SceneView = ({
   onSheetDetentChanged,
 }: SceneViewProps) => {
   const { route, navigation, options, render } = descriptor;
+
+  React.useLayoutEffect(() => {
+    if (Platform.OS !== 'ios' || index <= 0) {
+      return;
+    }
+
+    const navigationAny = navigation as any;
+    const originalDispatch =
+      navigationAny[ORIGINAL_DISPATCH_KEY] ??
+      navigationAny.dispatch?.bind(navigation);
+    const originalGoBack = navigationAny.goBack;
+    const originalPop = navigationAny.pop;
+    const originalPopToTop = navigationAny.popToTop;
+
+    if (typeof originalDispatch !== 'function') {
+      return;
+    }
+
+    navigationAny[ORIGINAL_DISPATCH_KEY] = originalDispatch;
+
+    const requestPop = (count = 1, attempt = 0) => {
+      void requestNativeScriptStackPop(route.key, count)
+        .then((result: string) => {
+          if (result === 'transitioning' && attempt < 8) {
+            setTimeout(() => requestPop(count, attempt + 1), 80);
+            return undefined;
+          }
+
+          if (result === 'ok-modal') {
+            originalDispatch({
+              ...StackActions.pop(count),
+              source: route.key,
+            });
+          }
+
+          return undefined;
+        })
+        .catch(() => undefined);
+    };
+    const patchedGoBack = () => {
+      requestPop(1);
+    };
+    const patchedPop = (count = 1) => {
+      requestPop(count);
+    };
+    const patchedPopToTop = () => {
+      requestPop(Number.MAX_SAFE_INTEGER);
+    };
+    const patchedDispatch = (actionOrThunk: any) => {
+      const action =
+        typeof actionOrThunk === 'function'
+          ? actionOrThunk(navigationAny.getState?.())
+          : actionOrThunk;
+      const nativePopCount = nativePopCountForAction(action);
+
+      if (nativePopCount != null) {
+        requestPop(nativePopCount);
+        return;
+      }
+
+      originalDispatch(action);
+    };
+
+    navigationAny.goBack = patchedGoBack;
+
+    if (typeof originalPop === 'function') {
+      navigationAny.pop = patchedPop;
+    }
+
+    if (typeof originalPopToTop === 'function') {
+      navigationAny.popToTop = patchedPopToTop;
+    }
+
+    navigationAny.dispatch = patchedDispatch;
+
+    return () => {
+      if (navigationAny.goBack === patchedGoBack) {
+        navigationAny.goBack = originalGoBack;
+      }
+
+      if (navigationAny.pop === patchedPop) {
+        navigationAny.pop = originalPop;
+      }
+
+      if (navigationAny.popToTop === patchedPopToTop) {
+        navigationAny.popToTop = originalPopToTop;
+      }
+
+      if (navigationAny.dispatch === patchedDispatch) {
+        navigationAny.dispatch = originalDispatch;
+      }
+    };
+  }, [index, navigation, route.key]);
 
   const {
     inactiveBehavior = 'pause',
@@ -379,7 +510,6 @@ const SceneView = ({
       </HeaderHeightContext.Provider>
     </AnimatedHeaderHeightContext.Provider>
   );
-
   return (
     <NavigationProvider navigation={navigation} route={route}>
       <ScreenStackItem
@@ -387,6 +517,7 @@ const SceneView = ({
         screenId={route.key}
         activityState={isInactive ? 0 : 2}
         style={StyleSheet.absoluteFill}
+        pointerEvents={isInactive ? 'none' : 'auto'}
         aria-hidden={!focused}
         customAnimationOnSwipe={animationMatchesGesture}
         fullScreenSwipeEnabled={fullScreenGestureEnabled}
@@ -449,16 +580,7 @@ const SceneView = ({
         unstable_sheetFooter={unstable_sheetFooter}
       >
         {activityMode === 'unmounted' ? null : (
-          <ActivityView
-            mode={activityMode}
-            visible={
-              // We don't need to hide the content since it's handled natively
-              // Hiding may also cause flash due to lag after native tab switch
-              // So we leave it always visible
-              true
-            }
-            style={styles.content}
-          >
+          <ActivityView mode={activityMode} visible style={styles.content}>
             {content}
           </ActivityView>
         )}
@@ -473,20 +595,154 @@ type Props = {
   descriptors: NativeStackDescriptorMap;
 };
 
+type RouteRecord = {
+  descriptor: NativeStackDescriptor;
+  index: number;
+  route: StackNavigationState<ParamListBase>['routes'][number];
+};
+
+function includesRouteKey(records: RouteRecord[], key: string) {
+  return records.some((record) => record.route.key === key);
+}
+
 export function NativeStackView({ state, navigation, descriptors }: Props) {
   const { setNextDismissedKey } = useDismissedRouteError(state);
+  const [, forceRetainedRoutesUpdate] = React.useReducer(
+    (value: number) => value + 1,
+    0
+  );
+  const previousRouteRecordsRef = React.useRef<RouteRecord[]>([]);
+  const retainedRouteRecordsRef = React.useRef<RouteRecord[]>([]);
+  const closingTransitionRouteKeysRef = React.useRef<Set<string>>(new Set());
+  const completedClosingRouteKeysRef = React.useRef<Set<string>>(new Set());
 
   useInvalidPreventRemoveError(descriptors);
 
   const activeRoutes = state.routes.slice(0, state.index + 1);
   const modalRouteKeys = getModalRouteKeys(activeRoutes, descriptors);
+  const currentRouteRecords = state.routes
+    .map((route, index) => {
+      const descriptor = descriptors[route.key];
+
+      return descriptor ? { descriptor, index, route } : null;
+    })
+    .filter((record): record is RouteRecord => record != null);
+  const previousRouteRecords = previousRouteRecordsRef.current;
+  const removedRouteRecords = previousRouteRecords.filter(
+    (record) => !includesRouteKey(currentRouteRecords, record.route.key)
+  );
+
+  if (removedRouteRecords.length > 0) {
+    const retainedRouteRecords = retainedRouteRecordsRef.current.filter(
+      (record) => !includesRouteKey(currentRouteRecords, record.route.key)
+    );
+
+    for (const record of removedRouteRecords) {
+      if (completedClosingRouteKeysRef.current.has(record.route.key)) {
+        completedClosingRouteKeysRef.current.delete(record.route.key);
+        continue;
+      }
+
+      if (!includesRouteKey(retainedRouteRecords, record.route.key)) {
+        retainedRouteRecords.push(record);
+      }
+    }
+
+    retainedRouteRecordsRef.current = retainedRouteRecords;
+  }
+
+  previousRouteRecordsRef.current = currentRouteRecords;
+
+  const retainedRouteRecords = retainedRouteRecordsRef.current.filter(
+    (record) => !includesRouteKey(currentRouteRecords, record.route.key)
+  );
+  const topRouteKey = activeRoutes[activeRoutes.length - 1]?.key;
+  const isTopRouteModal =
+    topRouteKey != null && modalRouteKeys.includes(topRouteKey);
+  const renderRouteRecords = [...currentRouteRecords, ...retainedRouteRecords]
+    .filter((record, index, records) => {
+      return (
+        records.findIndex((item) => item.route.key === record.route.key) ===
+        index
+      );
+    })
+    .sort((left, right) => left.index - right.index);
+
+  if (retainedRouteRecords.length !== retainedRouteRecordsRef.current.length) {
+    retainedRouteRecordsRef.current = retainedRouteRecords;
+  }
+
+  const clearRetainedRoute = React.useCallback((routeKey: string) => {
+    const nextRecords = retainedRouteRecordsRef.current.filter(
+      (record) => record.route.key !== routeKey
+    );
+
+    if (nextRecords.length !== retainedRouteRecordsRef.current.length) {
+      retainedRouteRecordsRef.current = nextRecords;
+      forceRetainedRoutesUpdate();
+    }
+  }, []);
+
+  const handleNativeStackTransition = React.useCallback(
+    (event: {
+      nativeEvent: {
+        closing: boolean;
+        phase: 'start' | 'end';
+        screenId: string;
+      };
+    }) => {
+      const { closing, phase, screenId } = event.nativeEvent;
+
+      if (phase === 'start' && closing) {
+        completedClosingRouteKeysRef.current.delete(screenId);
+        closingTransitionRouteKeysRef.current.add(screenId);
+        return;
+      }
+
+      closingTransitionRouteKeysRef.current.delete(screenId);
+
+      if (closing) {
+        completedClosingRouteKeysRef.current.add(screenId);
+      } else {
+        completedClosingRouteKeysRef.current.delete(screenId);
+      }
+
+      clearRetainedRoute(screenId);
+    },
+    [clearRetainedRoute]
+  );
+
+  React.useEffect(() => {
+    if (!topRouteKey || isTopRouteModal) {
+      return;
+    }
+
+    const repair = () => {
+      repairNativeScriptStackAfterDismiss(topRouteKey);
+    };
+    const lateRepair = setTimeout(repair, 420);
+    const finalRepair = setTimeout(repair, 700);
+
+    return () => {
+      clearTimeout(lateRepair);
+      clearTimeout(finalRepair);
+    };
+  }, [isTopRouteModal, topRouteKey]);
 
   return (
     <SafeAreaProviderCompat>
-      <ScreenStack style={styles.container}>
-        {state.routes.map((route, index) => {
-          const descriptor = descriptors[route.key];
-          const isFocused = state.index === index;
+      <ScreenStack
+        onNativeStackTransition={handleNativeStackTransition}
+        style={styles.container}
+      >
+        {renderRouteRecords.map(({ descriptor, route, index }) => {
+          const isRouteActive = activeRoutes.some(
+            (activeRoute) => activeRoute.key === route.key
+          );
+          const isClosingRetainedRoute =
+            !isRouteActive &&
+            closingTransitionRouteKeysRef.current.has(route.key);
+          const isFocused = isRouteActive && state.index === index;
           const previousKey = activeRoutes[index - 1]?.key;
           const nextKey = activeRoutes[index + 1]?.key;
           const previousDescriptor = previousKey
@@ -512,7 +768,9 @@ export function NativeStackView({ state, navigation, descriptors }: Props) {
               nextDescriptor={nextDescriptor}
               isPresentationModal={isModal}
               isNextScreenTransparent={isNextScreenTransparent}
-              isInactive={index > state.index}
+              isInactive={
+                !isRouteActive ? !isClosingRetainedRoute : index > state.index
+              }
               isBeforeLast={index === activeRoutes.length - 2}
               onWillDisappear={() => {
                 navigation.emit({
@@ -541,25 +799,36 @@ export function NativeStackView({ state, navigation, descriptors }: Props) {
                   data: { closing: true },
                   target: route.key,
                 });
+                clearRetainedRoute(route.key);
               }}
               onDismissed={(event) => {
-                navigation.dispatch({
+                completedClosingRouteKeysRef.current.add(route.key);
+                dispatchWithOriginalNavigation(navigation, {
                   ...StackActions.pop(event.nativeEvent.dismissCount),
                   source: route.key,
                   target: state.key,
                 });
 
                 setNextDismissedKey(route.key);
+                clearRetainedRoute(route.key);
+
+                const repair = () => {
+                  repairNativeScriptStackAfterDismiss(route.key);
+                };
+
+                repair();
+                setTimeout(repair, 64);
+                setTimeout(repair, 250);
               }}
               onHeaderBackButtonClicked={() => {
-                navigation.dispatch({
+                dispatchWithOriginalNavigation(navigation, {
                   ...StackActions.pop(),
                   source: route.key,
                   target: state.key,
                 });
               }}
               onNativeDismissCancelled={(event) => {
-                navigation.dispatch({
+                dispatchWithOriginalNavigation(navigation, {
                   ...StackActions.pop(event.nativeEvent.dismissCount),
                   source: route.key,
                   target: state.key,
