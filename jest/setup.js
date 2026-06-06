@@ -1,5 +1,16 @@
 /* global console */
 
+jest.mock(
+  '@nativescript/react-native',
+  () => ({
+    defineUIViewController:
+      () =>
+      ({ children }) =>
+        children ?? null,
+  }),
+  { virtual: true }
+);
+
 const error = console.error;
 
 console.error = (...args) =>

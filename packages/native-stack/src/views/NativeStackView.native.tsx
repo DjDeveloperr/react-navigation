@@ -27,11 +27,7 @@ import {
   View,
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
-import {
-  type ScreenProps,
-  ScreenStack,
-  ScreenStackItem,
-} from 'react-native-screens';
+import { type ScreenProps } from 'react-native-screens';
 
 import type {
   NativeStackDescriptor,
@@ -43,6 +39,10 @@ import { getModalRouteKeys } from '../utils/getModalRoutesKeys';
 import { AnimatedHeaderHeightContext } from '../utils/useAnimatedHeaderHeight';
 import { useDismissedRouteError } from '../utils/useDismissedRouteError';
 import { useInvalidPreventRemoveError } from '../utils/useInvalidPreventRemoveError';
+import {
+  NativeScriptScreenStack as ScreenStack,
+  NativeScriptScreenStackItem as ScreenStackItem,
+} from './NativeScriptScreenStack';
 import { useHeaderConfigProps } from './useHeaderConfigProps';
 
 const ANDROID_DEFAULT_HEADER_HEIGHT = 56;

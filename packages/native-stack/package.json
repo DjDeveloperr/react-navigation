@@ -63,6 +63,7 @@
     "typescript": "^6.0.3"
   },
   "peerDependencies": {
+    "@nativescript/react-native": "*",
     "@react-navigation/native": "workspace:^",
     "react": ">= 19.2.0",
     "react-native": "*",

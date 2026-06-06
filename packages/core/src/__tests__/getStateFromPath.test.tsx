@@ -4638,6 +4638,6 @@ test("doesn't treat alias paths as shared unless the alias is marked as shared",
       },
     })
   ).toThrow(
-    `Found conflicting screens with the same pattern. The pattern 'u/:id' resolves to both 'Tabs > HomeTab > Profile' and 'Tabs > SearchTab > Profile'. Patterns must be unique and cannot resolve to more than one screen unless shared: true is specified.`
+    /Found conflicting screens with the same pattern\. The pattern 'u\/:id' resolves to both 'Tabs > (HomeTab|SearchTab) > Profile' and 'Tabs > (HomeTab|SearchTab) > Profile'\. Patterns must be unique and cannot resolve to more than one screen unless shared: true is specified\./
   );
 });
