@@ -59,7 +59,11 @@ declare module '@nativescript/react-native' {
   ): React.ComponentType<
     React.PropsWithChildren<
       Props &
-        ViewProps & { attachController?: boolean; attachNativeView?: boolean }
+        ViewProps & {
+          attachController?: boolean;
+          attachControllerView?: boolean;
+          attachNativeView?: boolean;
+        }
     >
   >;
 }

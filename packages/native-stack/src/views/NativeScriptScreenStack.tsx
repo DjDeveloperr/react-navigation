@@ -15,7 +15,7 @@ import type {
 
 const REGISTRY_KEY = '__reactNavigationNativeScriptStackRegistry';
 const MOUNT_VIEW_TAG = 82734091;
-const STACK_TRANSITION_MS = 420;
+const BACK_BUTTON_TAG = 82734092;
 const SCREEN_ID_SEPARATOR = '\u001f';
 
 let nextStackId = 0;
@@ -32,7 +32,9 @@ type NativeScriptStackRegistry = {
   stackTransitionScreenIds: Record<string, string | undefined>;
   stackTransitionTokens: Record<string, number | undefined>;
   screenHeaderConfigs: Record<string, ScreenStackHeaderConfigProps | undefined>;
+  screenContexts: Record<string, any>;
   screenParents: Record<string, string | undefined>;
+  screenProps: Record<string, NativeScriptScreenStackItemProps | undefined>;
 };
 
 type NativeStackChangeEvent = {
@@ -67,6 +69,25 @@ type NativeScriptScreenStackItemProps = Omit<
     screenId: string;
   };
 
+type RegisteredStackItem = {
+  active: boolean;
+  order: number;
+  props: NativeScriptScreenStackItemProps;
+};
+
+type NativeScriptScreenStackContextValue = {
+  stackId: string;
+  registerScreen: (
+    screenId: string,
+    props: NativeScriptScreenStackItemProps,
+    active: boolean
+  ) => void;
+  unregisterScreen: (screenId: string) => void;
+};
+
+const NativeScriptScreenStackContext =
+  React.createContext<NativeScriptScreenStackContextValue | null>(null);
+
 function getRegistry(
   globalObject: Record<string, any>
 ): NativeScriptStackRegistry {
@@ -89,7 +110,9 @@ function getRegistry(
     stackTransitionScreenIds: {},
     stackTransitionTokens: {},
     screenHeaderConfigs: {},
+    screenContexts: {},
     screenParents: {},
+    screenProps: {},
   };
 
   globalObject[REGISTRY_KEY] = registry;
@@ -185,6 +208,48 @@ function largeTitleDisplayMode(enabled: boolean) {
     : (enumValue?.Never ?? enumValue?.never ?? 2);
 }
 
+function plainBarButtonStyle() {
+  'worklet';
+  const style = nativeValue('UIBarButtonItemStyle');
+
+  return style?.Plain ?? style?.plain ?? 0;
+}
+
+function touchUpInsideControlEvent() {
+  'worklet';
+  const events = nativeValue('UIControlEvents');
+
+  return (
+    events?.TouchUpInside ??
+    events?.touchUpInside ??
+    nativeValue('UIControlEventTouchUpInside') ??
+    64
+  );
+}
+
+function systemButtonType() {
+  'worklet';
+  const type = nativeValue('UIButtonType');
+
+  return type?.System ?? type?.system ?? 1;
+}
+
+function normalControlState() {
+  'worklet';
+  const state = nativeValue('UIControlState');
+
+  return (
+    state?.Normal ?? state?.normal ?? nativeValue('UIControlStateNormal') ?? 0
+  );
+}
+
+function leftContentAlignment() {
+  'worklet';
+  const alignment = nativeValue('UIControlContentHorizontalAlignment');
+
+  return alignment?.Left ?? alignment?.left ?? 1;
+}
+
 function configureExtendedLayout(controller: any) {
   'worklet';
 
@@ -194,62 +259,6 @@ function configureExtendedLayout(controller: any) {
 
   controller.edgesForExtendedLayout = rectEdgeAll();
   controller.extendedLayoutIncludesOpaqueBars = true;
-}
-
-function configureVisibleBackButton(
-  navigationController: any,
-  headerConfig?: ScreenStackHeaderConfigProps
-) {
-  'worklet';
-  const viewControllers = navigationController?.viewControllers;
-  const count = arrayCount(viewControllers);
-
-  if (count < 2) {
-    return;
-  }
-
-  const previousController = arrayItem(viewControllers, count - 2);
-  const navigationItem = previousController?.navigationItem;
-
-  if (!navigationItem) {
-    return;
-  }
-
-  const displayMode = backButtonDisplayMode(
-    headerConfig?.backTitleVisible === false
-      ? 'minimal'
-      : headerConfig?.backButtonDisplayMode
-  );
-
-  navigationItem.backButtonDisplayMode = displayMode;
-
-  if (
-    headerConfig?.backTitle != null ||
-    headerConfig?.backTitleVisible === false
-  ) {
-    const UIBarButtonItem = nativeValue('UIBarButtonItem');
-    const style =
-      nativeValue('UIBarButtonItemStyle')?.Plain ??
-      nativeValue('UIBarButtonItemStyle')?.plain ??
-      0;
-
-    if (UIBarButtonItem && typeof UIBarButtonItem.alloc === 'function') {
-      const itemAllocated = UIBarButtonItem.alloc();
-      const title =
-        headerConfig.backTitleVisible === false ? '' : headerConfig.backTitle;
-
-      navigationItem.backBarButtonItem =
-        itemAllocated &&
-        typeof itemAllocated.initWithTitleStyleTargetAction === 'function'
-          ? itemAllocated.initWithTitleStyleTargetAction(
-              title,
-              style,
-              null,
-              null
-            )
-          : itemAllocated;
-    }
-  }
 }
 
 function createArray(values: any[]) {
@@ -293,6 +302,221 @@ function arrayItem(value: any, index: number) {
   }
 
   return value[index] ?? null;
+}
+
+function flexibleSizeMask() {
+  'worklet';
+
+  return 18;
+}
+
+function isNativeScrollView(view: any) {
+  'worklet';
+  const UIScrollView = nativeValue('UIScrollView');
+
+  return Boolean(
+    UIScrollView &&
+    view &&
+    typeof view.isKindOfClass === 'function' &&
+    view.isKindOfClass(UIScrollView)
+  );
+}
+
+function shouldFillHostedSubview(rootView: any, subview: any) {
+  'worklet';
+  const parentBounds = rootView?.bounds ?? rootView?.frame;
+  const frame = subview?.frame;
+  const parentWidth = parentBounds?.size?.width ?? 0;
+  const childWidth = frame?.size?.width ?? 0;
+  const originX = frame?.origin?.x ?? 0;
+  const originY = frame?.origin?.y ?? 0;
+
+  if (parentWidth <= 0) {
+    return false;
+  }
+
+  return (
+    Math.abs(originX) < 1 &&
+    Math.abs(originY) < 1 &&
+    (childWidth <= 0 || Math.abs(childWidth - parentWidth) < 2)
+  );
+}
+
+function layoutHostedSubviewChain(rootView: any, depth: number) {
+  'worklet';
+
+  if (!rootView || depth > 8 || isNativeScrollView(rootView)) {
+    return;
+  }
+
+  const subviews = rootView.subviews;
+  const count = arrayCount(subviews);
+
+  for (let index = 0; index < count; index += 1) {
+    const subview = arrayItem(subviews, index);
+
+    if (!subview || !shouldFillHostedSubview(rootView, subview)) {
+      continue;
+    }
+
+    subview.frame = rootView.bounds;
+    subview.autoresizingMask = flexibleSizeMask();
+
+    layoutHostedSubviewChain(subview, depth + 1);
+  }
+}
+
+function layoutHostedReactSubviews(controller: any) {
+  'worklet';
+  const rootView = controller?.view;
+
+  if (!rootView) {
+    return;
+  }
+
+  const subviews = rootView.subviews;
+  const count = arrayCount(subviews);
+
+  for (let index = 0; index < count; index += 1) {
+    const subview = arrayItem(subviews, index);
+
+    if (!subview) {
+      continue;
+    }
+
+    subview.frame = rootView.bounds;
+    subview.autoresizingMask = flexibleSizeMask();
+    layoutHostedSubviewChain(subview, 0);
+  }
+}
+
+function layoutNavigationStackViews(navigationController: any) {
+  'worklet';
+
+  if (!navigationController?.view) {
+    return;
+  }
+
+  const parentBounds =
+    navigationController.tabBarController?.view?.bounds ??
+    navigationController.view.superview?.bounds;
+
+  if (parentBounds) {
+    navigationController.view.frame = parentBounds;
+  }
+
+  navigationController.view.autoresizingMask = flexibleSizeMask();
+
+  const viewControllers = navigationController.viewControllers;
+  const count = arrayCount(viewControllers);
+
+  for (let index = 0; index < count; index += 1) {
+    const controller = arrayItem(viewControllers, index);
+
+    if (!controller?.view) {
+      continue;
+    }
+
+    controller.view.frame = navigationController.view.bounds;
+    controller.view.autoresizingMask = flexibleSizeMask();
+    layoutHostedReactSubviews(controller);
+  }
+}
+
+function configureHeaderBackButton(
+  controller: any,
+  props: Readonly<NativeScriptScreenStackItemProps>,
+  ctx: any,
+  isTopScreen: boolean
+) {
+  'worklet';
+  const navigationController = controller?.navigationController;
+  const navigationItem = controller?.navigationItem;
+
+  if (!navigationController || !navigationItem) {
+    return;
+  }
+
+  const viewControllers = navigationController.viewControllers;
+  const count = arrayCount(viewControllers);
+  const existingItem = navigationItem.leftBarButtonItem;
+  const existingButton = existingItem?.customView;
+  const hasNativeScriptBackButton = existingButton?.tag === BACK_BUTTON_TAG;
+  const shouldShowBackButton =
+    count > 1 &&
+    isTopScreen &&
+    props.headerConfig?.hideBackButton !== true &&
+    typeof props.onHeaderBackButtonClicked === 'function';
+
+  if (!shouldShowBackButton) {
+    if (hasNativeScriptBackButton) {
+      navigationItem.leftBarButtonItem = null;
+    }
+    navigationItem.hidesBackButton =
+      props.headerConfig?.hideBackButton === true;
+    return;
+  }
+
+  navigationItem.hidesBackButton = true;
+
+  if (hasNativeScriptBackButton) {
+    return;
+  }
+
+  const UIButton = nativeValue('UIButton');
+  const UIBarButtonItem = nativeValue('UIBarButtonItem');
+
+  if (
+    !ctx ||
+    !UIButton ||
+    typeof UIButton.buttonWithType !== 'function' ||
+    !UIBarButtonItem ||
+    typeof UIBarButtonItem.alloc !== 'function'
+  ) {
+    return;
+  }
+
+  const button = UIButton.buttonWithType(systemButtonType());
+
+  button.tag = BACK_BUTTON_TAG;
+  button.accessibilityLabel = 'Back';
+  button.contentHorizontalAlignment = leftContentAlignment();
+
+  const CGRectMake = nativeValue('CGRectMake');
+  button.frame =
+    typeof CGRectMake === 'function'
+      ? CGRectMake(0, 0, 44, 44)
+      : { origin: { x: 0, y: 0 }, size: { width: 44, height: 44 } };
+
+  const UIImage = nativeValue('UIImage');
+  const chevron =
+    UIImage && typeof UIImage.systemImageNamed === 'function'
+      ? UIImage.systemImageNamed('chevron.backward')
+      : null;
+
+  if (chevron && typeof button.setImageForState === 'function') {
+    button.setImageForState(chevron, normalControlState());
+  } else if (typeof button.setTitleForState === 'function') {
+    button.setTitleForState('‹', normalControlState());
+  }
+
+  ctx.targetAction(button, touchUpInsideControlEvent(), () => {
+    'worklet';
+    ctx.emit('onHeaderBackButtonClicked', {
+      nativeEvent: {},
+    });
+  });
+
+  const allocatedItem = UIBarButtonItem.alloc();
+  const item =
+    allocatedItem && typeof allocatedItem.initWithCustomView === 'function'
+      ? allocatedItem.initWithCustomView(button)
+      : allocatedItem;
+
+  if (item) {
+    item.style = plainBarButtonStyle();
+    navigationItem.leftBarButtonItem = item;
+  }
 }
 
 function screenIdForController(
@@ -390,7 +614,36 @@ function updateNativeBackGesture(navigationController: any) {
     return;
   }
 
-  gesture.enabled = arrayCount(navigationController.viewControllers) > 1;
+  const count = arrayCount(navigationController.viewControllers);
+
+  gesture.enabled = count > 1;
+}
+
+function installNativeBackGestureDelegate(navigationController: any, ctx: any) {
+  'worklet';
+  const gesture = navigationController?.interactivePopGestureRecognizer;
+
+  if (!gesture || !ctx) {
+    return;
+  }
+
+  const delegateProtocol =
+    nativeValue('UIGestureRecognizerDelegate') ?? 'UIGestureRecognizerDelegate';
+
+  ctx.delegate(gesture, delegateProtocol, {
+    gestureRecognizerShouldBegin() {
+      'worklet';
+
+      return arrayCount(navigationController.viewControllers) > 1;
+    },
+    gestureRecognizerShouldRecognizeSimultaneouslyWithGestureRecognizer() {
+      'worklet';
+
+      return true;
+    },
+  });
+
+  updateNativeBackGesture(navigationController);
 }
 
 function configureNavigationAppearance(
@@ -405,7 +658,53 @@ function configureNavigationAppearance(
 
   configureExtendedLayout(navigationController);
   updateNativeBackGesture(navigationController);
-  configureVisibleBackButton(navigationController, headerConfig);
+  layoutNavigationStackViews(navigationController);
+
+  const viewControllers = navigationController.viewControllers;
+  const count = arrayCount(viewControllers);
+
+  if (count >= 2) {
+    const previousController = arrayItem(viewControllers, count - 2);
+    const navigationItem = previousController?.navigationItem;
+
+    if (navigationItem) {
+      navigationItem.backButtonDisplayMode = backButtonDisplayMode(
+        headerConfig?.backTitleVisible === false
+          ? 'minimal'
+          : headerConfig?.backButtonDisplayMode
+      );
+
+      if (
+        headerConfig?.backTitle != null ||
+        headerConfig?.backTitleVisible === false
+      ) {
+        const UIBarButtonItem = nativeValue('UIBarButtonItem');
+        const style =
+          nativeValue('UIBarButtonItemStyle')?.Plain ??
+          nativeValue('UIBarButtonItemStyle')?.plain ??
+          0;
+
+        if (UIBarButtonItem && typeof UIBarButtonItem.alloc === 'function') {
+          const itemAllocated = UIBarButtonItem.alloc();
+          const title =
+            headerConfig.backTitleVisible === false
+              ? ''
+              : headerConfig.backTitle;
+
+          navigationItem.backBarButtonItem =
+            itemAllocated &&
+            typeof itemAllocated.initWithTitleStyleTargetAction === 'function'
+              ? itemAllocated.initWithTitleStyleTargetAction(
+                  title,
+                  style,
+                  null,
+                  null
+                )
+              : itemAllocated;
+        }
+      }
+    }
+  }
 
   const navigationBar = navigationController.navigationBar;
 
@@ -419,10 +718,10 @@ function configureNavigationAppearance(
     typeof navigationController.setNavigationBarHiddenAnimated === 'function'
   ) {
     navigationController.setNavigationBarHiddenAnimated(hidden, false);
-  } else {
-    navigationBar.hidden = hidden;
   }
 
+  navigationController.navigationBarHidden = hidden;
+  navigationBar.hidden = hidden;
   navigationBar.prefersLargeTitles = headerConfig?.largeTitle === true;
   navigationBar.translucent = headerConfig?.translucent !== false;
 
@@ -481,7 +780,9 @@ function configureNavigationAppearance(
 
 function configureScreenController(
   controller: any,
-  props: Readonly<NativeScriptScreenStackItemProps>
+  props: Readonly<NativeScriptScreenStackItemProps>,
+  ctx?: any,
+  isTopScreen = false
 ) {
   'worklet';
 
@@ -493,10 +794,12 @@ function configureScreenController(
   controller.title = headerConfig?.title ?? '';
 
   if (controller.view) {
+    controller.view.autoresizingMask = flexibleSizeMask();
     controller.view.backgroundColor = nativeColor(
       headerConfig?.backgroundColor,
       'systemBackgroundColor'
     );
+    layoutHostedReactSubviews(controller);
   }
 
   if (navigationItem) {
@@ -516,6 +819,32 @@ function configureScreenController(
 
   if (navigationController) {
     configureNavigationAppearance(navigationController, headerConfig);
+    layoutNavigationStackViews(navigationController);
+  }
+
+  configureHeaderBackButton(controller, props, ctx, isTopScreen);
+}
+
+function configureStackControllers(
+  ids: string[],
+  registry: NativeScriptStackRegistry
+) {
+  'worklet';
+
+  for (const id of ids) {
+    const controller = registry.screens[id];
+    const props = registry.screenProps[id];
+
+    if (!controller || !props) {
+      continue;
+    }
+
+    configureScreenController(
+      controller,
+      props,
+      registry.screenContexts[id],
+      id === ids[ids.length - 1]
+    );
   }
 }
 
@@ -537,6 +866,25 @@ function emitStackChange(ctx: any, navigationController: any) {
       screenIds,
     },
   });
+}
+
+function scheduleStackChange(ctx: any, navigationController: any) {
+  'worklet';
+
+  emitStackChange(ctx, navigationController);
+
+  if (typeof setTimeout !== 'function') {
+    return;
+  }
+
+  const emit = () => {
+    'worklet';
+    emitStackChange(ctx, navigationController);
+  };
+
+  setTimeout(emit, 0);
+  setTimeout(emit, 64);
+  setTimeout(emit, 160);
 }
 
 function emitTransition(
@@ -575,26 +923,6 @@ function markTransition(
   registry.stackTransitionClosing[stackId] = closing;
   registry.stackTransitionScreenIds[stackId] = screenId;
   emitTransition(ctx, 'start', closing, screenId);
-
-  if (typeof setTimeout === 'function') {
-    setTimeout(() => {
-      'worklet';
-
-      if (registry.stackTransitionTokens[stackId] !== token) {
-        return;
-      }
-
-      registry.stackTransitioning[stackId] = false;
-      registry.stackTransitionClosing[stackId] = undefined;
-      registry.stackTransitionScreenIds[stackId] = undefined;
-      emitTransition(ctx, 'end', closing, screenId);
-      reconcileStack(stackId, registry, ctx, false);
-    }, STACK_TRANSITION_MS);
-  } else {
-    registry.stackTransitioning[stackId] = false;
-    registry.stackTransitionClosing[stackId] = undefined;
-    registry.stackTransitionScreenIds[stackId] = undefined;
-  }
 }
 
 function animateStackPush(parent: any, controller: any) {
@@ -683,6 +1011,8 @@ function reconcileStack(
 
   if (!didChange && idsEqual(nativeIds, availableIds)) {
     updateNativeBackGesture(navigationController);
+    layoutNavigationStackViews(navigationController);
+    configureStackControllers(availableIds, registry);
     configureNavigationAppearance(
       navigationController,
       registry.screenHeaderConfigs[availableIds[nextCount - 1]]
@@ -693,11 +1023,6 @@ function reconcileStack(
   if (didChange) {
     registry.stackNativeKeys[stackId] = nextKey;
     registry.stackNativeCounts[stackId] = nextCount;
-  }
-
-  if (registry.stackTransitioning[stackId]) {
-    updateNativeBackGesture(navigationController);
-    return;
   }
 
   if (animated && previousKey != null && previousCount > 0) {
@@ -721,6 +1046,8 @@ function reconcileStack(
       markTransition(stackId, registry, ctx, false, pushedScreenId);
 
       if (animateStackPush(navigationController, controllers[nextCount - 1])) {
+        layoutNavigationStackViews(navigationController);
+        configureStackControllers(availableIds, registry);
         configureNavigationAppearance(
           navigationController,
           registry.screenHeaderConfigs[availableIds[nextCount - 1]]
@@ -731,6 +1058,8 @@ function reconcileStack(
       }
 
       registry.stackTransitioning[stackId] = false;
+      registry.stackTransitionClosing[stackId] = undefined;
+      registry.stackTransitionScreenIds[stackId] = undefined;
     }
 
     if (isPop && nativeIds.length > nextCount) {
@@ -746,6 +1075,8 @@ function reconcileStack(
           previousCount
         )
       ) {
+        layoutNavigationStackViews(navigationController);
+        configureStackControllers(availableIds, registry);
         configureNavigationAppearance(
           navigationController,
           registry.screenHeaderConfigs[availableIds[nextCount - 1]]
@@ -756,6 +1087,8 @@ function reconcileStack(
       }
 
       registry.stackTransitioning[stackId] = false;
+      registry.stackTransitionClosing[stackId] = undefined;
+      registry.stackTransitionScreenIds[stackId] = undefined;
     }
   }
 
@@ -768,6 +1101,8 @@ function reconcileStack(
     navigationController.viewControllers = createArray(controllers);
   }
 
+  layoutNavigationStackViews(navigationController);
+  configureStackControllers(availableIds, registry);
   configureNavigationAppearance(
     navigationController,
     registry.screenHeaderConfigs[availableIds[nextCount - 1]]
@@ -838,10 +1173,13 @@ const NativeScriptStackController = NativeScriptRuntime.defineUIViewController<
       mountView.tag = MOUNT_VIEW_TAG;
       mountView.hidden = true;
       mountView.userInteractionEnabled = false;
+      mountView.frame = controller.view.bounds;
+      mountView.autoresizingMask = 18;
       controller.view.addSubview(mountView);
     }
 
     controller.viewControllers = createArray([placeholder]);
+    installNativeBackGestureDelegate(controller, ctx);
 
     const delegateProtocol =
       nativeValue('UINavigationControllerDelegate') ??
@@ -868,6 +1206,16 @@ const NativeScriptStackController = NativeScriptRuntime.defineUIViewController<
           ? currentIds[currentIds.length - 1]
           : (nextScreenId ?? activeIds[activeIds.length - 1]);
 
+        if (!nextScreenId) {
+          return;
+        }
+
+        layoutNavigationStackViews(navigationController);
+        configureStackControllers(
+          navigationControllerScreenIds(navigationController, registry),
+          registry
+        );
+
         if (registry.stackTransitioning[ctx.props.stackId]) {
           return;
         }
@@ -885,16 +1233,30 @@ const NativeScriptStackController = NativeScriptRuntime.defineUIViewController<
         const registry = getRegistry(globalThis as Record<string, any>);
         const screenId = screenIdForController(viewController, registry);
 
+        if (!screenId) {
+          layoutNavigationStackViews(navigationController);
+          updateNativeBackGesture(navigationController);
+          return;
+        }
+
+        layoutNavigationStackViews(navigationController);
+        configureStackControllers(
+          navigationControllerScreenIds(navigationController, registry),
+          registry
+        );
         updateNativeBackGesture(navigationController);
         configureNavigationAppearance(
           navigationController,
-          screenId ? registry.screenHeaderConfigs[screenId] : undefined
+          registry.screenHeaderConfigs[screenId]
         );
-        emitStackChange(ctx, navigationController);
+        scheduleStackChange(ctx, navigationController);
+        const wasClosing =
+          registry.stackTransitionClosing[ctx.props.stackId] === true;
+
         emitTransition(
           ctx,
           'end',
-          registry.stackTransitionClosing[ctx.props.stackId] === true,
+          wasClosing,
           registry.stackTransitionScreenIds[ctx.props.stackId] ?? screenId
         );
         registry.stackTransitioning[ctx.props.stackId] = false;
@@ -902,6 +1264,10 @@ const NativeScriptStackController = NativeScriptRuntime.defineUIViewController<
         registry.stackTransitionScreenIds[ctx.props.stackId] = undefined;
         registry.stackTransitionTokens[ctx.props.stackId] =
           (registry.stackTransitionTokens[ctx.props.stackId] ?? 0) + 1;
+
+        if (!wasClosing) {
+          reconcileStack(ctx.props.stackId, registry, ctx, true);
+        }
       },
     });
 
@@ -987,32 +1353,38 @@ const NativeScriptScreenController = NativeScriptRuntime.defineUIViewController<
 
     return controller.view;
   },
-  mounted(controller, props) {
+  mounted(controller, props, ctx) {
     'worklet';
     const registry = getRegistry(globalThis as Record<string, any>);
 
     registry.screens[props.screenId] = controller;
     registry.screenHeaderConfigs[props.screenId] = props.headerConfig;
+    registry.screenContexts[props.screenId] = ctx;
     registry.screenParents[props.screenId] = props.parentId;
-    configureScreenController(controller, props);
+    registry.screenProps[props.screenId] = props;
+    configureScreenController(controller, props, ctx);
 
     if (props.parentId) {
+      const shouldAnimate = registry.stackNativeKeys[props.parentId] != null;
+
       reconcileStack(
         props.parentId,
         registry,
         registry.stackContexts[props.parentId],
-        false
+        shouldAnimate
       );
     }
   },
-  update(controller, props) {
+  update(controller, props, _previousProps, ctx) {
     'worklet';
     const registry = getRegistry(globalThis as Record<string, any>);
 
     registry.screens[props.screenId] = controller;
     registry.screenHeaderConfigs[props.screenId] = props.headerConfig;
+    registry.screenContexts[props.screenId] = ctx;
     registry.screenParents[props.screenId] = props.parentId;
-    configureScreenController(controller, props);
+    registry.screenProps[props.screenId] = props;
+    configureScreenController(controller, props, ctx);
 
     if (props.parentId) {
       reconcileStack(
@@ -1033,7 +1405,9 @@ const NativeScriptScreenController = NativeScriptRuntime.defineUIViewController<
 
     registry.screens[props.screenId] = undefined;
     registry.screenHeaderConfigs[props.screenId] = undefined;
+    registry.screenContexts[props.screenId] = undefined;
     registry.screenParents[props.screenId] = undefined;
+    registry.screenProps[props.screenId] = undefined;
 
     if (props.parentId) {
       reconcileStack(
@@ -1046,10 +1420,6 @@ const NativeScriptScreenController = NativeScriptRuntime.defineUIViewController<
   },
 });
 
-function isActiveStackChild(element: React.ReactElement<any>) {
-  return element.props.activityState !== 0;
-}
-
 export function NativeScriptScreenStack({
   children,
   onNativeStackChange,
@@ -1060,32 +1430,68 @@ export function NativeScriptScreenStack({
   const itemPropsByScreenIdRef = React.useRef<
     Map<string, NativeScriptScreenStackItemProps>
   >(new Map());
+  const registeredItemsRef = React.useRef<Map<string, RegisteredStackItem>>(
+    new Map()
+  );
+  const nextItemOrderRef = React.useRef(0);
   const activeScreenIdsRef = React.useRef<string[]>([]);
+  const [, forceVersion] = React.useReducer((value: number) => value + 1, 0);
 
   if (stackId.current === null) {
     nextStackId += 1;
     stackId.current = `rn-ns-stack-${nextStackId}`;
   }
 
-  const childrenArray = React.Children.toArray(children);
-  const activeScreenIds: string[] = [];
-  const clonedChildren = childrenArray.map((child) => {
-    if (!React.isValidElement(child)) {
-      return child;
+  const registerScreen = React.useCallback(
+    (
+      screenId: string,
+      props: NativeScriptScreenStackItemProps,
+      active: boolean
+    ) => {
+      const existing = registeredItemsRef.current.get(screenId);
+      const order = existing?.order ?? nextItemOrderRef.current++;
+      const shouldUpdate =
+        !existing ||
+        existing.active !== active ||
+        existing.props.parentId !== props.parentId ||
+        existing.props.headerConfig !== props.headerConfig;
+
+      registeredItemsRef.current.set(screenId, {
+        active,
+        order,
+        props,
+      });
+      itemPropsByScreenIdRef.current.set(screenId, props);
+
+      if (shouldUpdate) {
+        forceVersion();
+      }
+    },
+    []
+  );
+
+  const unregisterScreen = React.useCallback((screenId: string) => {
+    const didDelete = registeredItemsRef.current.delete(screenId);
+    itemPropsByScreenIdRef.current.delete(screenId);
+
+    if (didDelete) {
+      forceVersion();
     }
+  }, []);
 
-    const props = child.props as NativeScriptScreenStackItemProps;
+  const contextValue = React.useMemo(
+    () => ({
+      registerScreen,
+      stackId: stackId.current!,
+      unregisterScreen,
+    }),
+    [registerScreen, unregisterScreen]
+  );
 
-    itemPropsByScreenIdRef.current.set(props.screenId, props);
-
-    if (isActiveStackChild(child)) {
-      activeScreenIds.push(props.screenId);
-    }
-
-    return React.cloneElement(child as React.ReactElement<any>, {
-      parentId: stackId.current,
-    });
-  });
+  const activeScreenIds = Array.from(registeredItemsRef.current.entries())
+    .filter(([, item]) => item.active)
+    .sort((left, right) => left[1].order - right[1].order)
+    .map(([screenId]) => screenId);
 
   activeScreenIdsRef.current = activeScreenIds;
 
@@ -1154,16 +1560,18 @@ export function NativeScriptScreenStack({
   );
 
   return (
-    <NativeScriptStackController
-      activeScreenIds={activeScreenIds}
-      attachController
-      onNativeStackChange={handleNativeStackChange}
-      onNativeStackTransition={handleNativeTransition}
-      stackId={stackId.current}
-      style={style}
-    >
-      {clonedChildren}
-    </NativeScriptStackController>
+    <NativeScriptScreenStackContext.Provider value={contextValue}>
+      <NativeScriptStackController
+        activeScreenIds={activeScreenIds}
+        attachController
+        onNativeStackChange={handleNativeStackChange}
+        onNativeStackTransition={handleNativeTransition}
+        stackId={stackId.current}
+        style={style}
+      >
+        {children}
+      </NativeScriptStackController>
+    </NativeScriptScreenStackContext.Provider>
   );
 }
 
@@ -1184,6 +1592,23 @@ export const NativeScriptScreenStackItem = React.forwardRef<
   },
   ref
 ) {
+  const stackContext = React.useContext(NativeScriptScreenStackContext);
+  const resolvedParentId = parentId ?? stackContext?.stackId;
+  const active = rest.activityState !== 0;
+  const registeredPropsRef =
+    React.useRef<NativeScriptScreenStackItemProps | null>(null);
+
+  registeredPropsRef.current = {
+    ...rest,
+    contentStyle,
+    headerConfig,
+    onHeaderHeightChange,
+    parentId: resolvedParentId,
+    screenId,
+    stackPresentation,
+    style,
+  } as NativeScriptScreenStackItemProps;
+
   const content = (
     <View
       ref={ref}
@@ -1213,14 +1638,28 @@ export const NativeScriptScreenStackItem = React.forwardRef<
     }
   }, [headerConfig?.hidden, onHeaderHeightChange, stackPresentation]);
 
+  React.useLayoutEffect(() => {
+    if (!stackContext) {
+      return;
+    }
+
+    stackContext.registerScreen(screenId, registeredPropsRef.current!, active);
+
+    return () => {
+      stackContext.unregisterScreen(screenId);
+    };
+  }, [active, headerConfig, resolvedParentId, screenId, stackContext]);
+
   return (
     <NativeScriptScreenController
       {...rest}
       attachController
+      attachControllerView={false}
+      attachNativeView={false}
       contentStyle={contentStyle}
       headerConfig={headerConfig}
       onHeaderHeightChange={onHeaderHeightChange}
-      parentId={parentId}
+      parentId={resolvedParentId}
       screenId={screenId}
       stackPresentation={stackPresentation}
       style={[styles.screen, style]}
